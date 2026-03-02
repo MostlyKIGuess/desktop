@@ -20,12 +20,77 @@ import {
   CollapsibleContent,
   CollapsibleTrigger,
 } from "@/components/ui/collapsible";
+import { Slider } from "@/components/ui/slider";
 import type { ThemeMode } from "@/hooks/useSyncedSettings";
 import { isKnownPythonEnv, isKnownRuntime } from "@/hooks/useSyncedSettings";
 import { cn } from "@/lib/utils";
 import type { EnvProgressState } from "../hooks/useEnvProgress";
 import type { UpdateStatus } from "../hooks/useUpdater";
 import type { KernelspecInfo } from "../types";
+
+/** Format seconds into human-readable duration */
+function formatDuration(secs: number): string {
+  if (secs >= 3600) return "Forever";
+  if (secs >= 60) {
+    const mins = Math.floor(secs / 60);
+    const remainingSecs = secs % 60;
+    return remainingSecs > 0 ? `${mins}m ${remainingSecs}s` : `${mins}m`;
+  }
+  return `${secs}s`;
+}
+
+/** Keep Alive slider - uses Radix Slider for consistency with widget controls */
+function KeepAliveSlider({
+  value,
+  onChange,
+}: {
+  value: number;
+  onChange: (value: number) => void;
+}) {
+  const [localValue, setLocalValue] = useState(value);
+
+  // Sync local value when prop changes externally
+  useEffect(() => {
+    setLocalValue(value);
+  }, [value]);
+
+  return (
+    <div className="space-y-3 pt-2 border-t border-border/50">
+      <div>
+        <span className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">
+          Advanced
+        </span>
+      </div>
+      <div className="space-y-1">
+        <div className="flex items-center justify-between">
+          <span className="text-xs font-medium text-muted-foreground">
+            Keep Alive
+          </span>
+          <span className="text-xs font-medium text-foreground tabular-nums">
+            {formatDuration(localValue)}
+          </span>
+        </div>
+        <p className="text-[10px] text-muted-foreground/70">
+          Time to keep notebook runtime alive after closing
+        </p>
+      </div>
+      <div className="py-2">
+        <Slider
+          value={[localValue]}
+          min={5}
+          max={3600}
+          step={5}
+          onValueChange={(v) => setLocalValue(v[0])}
+          onValueCommit={(v) => onChange(v[0])}
+        />
+      </div>
+      <div className="flex justify-between text-[10px] text-muted-foreground/70">
+        <span>5s</span>
+        <span>Forever</span>
+      </div>
+    </div>
+  );
+}
 
 /** Deno logo icon (from tabler icons) */
 function DenoIcon({ className }: { className?: string }) {
@@ -848,35 +913,10 @@ export function NotebookToolbar({
 
             {/* Advanced settings */}
             {onKeepAliveSecsChange && (
-              <div className="space-y-2 pt-2 border-t border-border/50">
-                <div>
-                  <span className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">
-                    Advanced
-                  </span>
-                </div>
-                <div className="flex items-center gap-3">
-                  <span className="text-xs font-medium text-muted-foreground">
-                    Keep Alive
-                  </span>
-                  <input
-                    type="number"
-                    min={0}
-                    max={3600}
-                    step={5}
-                    value={keepAliveSecs}
-                    onChange={(e) =>
-                      onKeepAliveSecsChange(
-                        Math.max(0, Math.min(3600, Number(e.target.value))),
-                      )
-                    }
-                    className="w-20 rounded-md border bg-muted/50 px-2 py-1 text-xs text-foreground focus:outline-none focus:ring-1 focus:ring-ring"
-                  />
-                  <span className="text-xs text-muted-foreground">seconds</span>
-                  <span className="text-[10px] text-muted-foreground/70 ml-2">
-                    Time to keep notebook room alive after closing
-                  </span>
-                </div>
-              </div>
+              <KeepAliveSlider
+                value={keepAliveSecs}
+                onChange={onKeepAliveSecsChange}
+              />
             )}
           </div>
         </CollapsibleContent>
