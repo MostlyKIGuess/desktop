@@ -32,5 +32,7 @@ conda: CondaDefaults,
 /**
  * How long (in seconds) to keep notebook rooms alive after all clients disconnect.
  * This allows you to close and reopen the window without losing your kernel state.
+ * `None` means keep alive forever (no automatic eviction).
+ * When set to a value, minimum is 5 seconds to prevent accidental instant eviction.
  */
-keep_alive_secs: bigint, };
+keep_alive_secs: bigint | null, };

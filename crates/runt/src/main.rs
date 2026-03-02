@@ -155,6 +155,11 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Shutdown a notebook's kernel and evict its room
+    Shutdown {
+        /// Path to the notebook file, or notebook ID (UUID) for untitled notebooks
+        path: PathBuf,
+    },
     /// Inspect the Automerge state for a notebook (debug command)
     #[command(hide = true)]
     Inspect {
@@ -482,6 +487,7 @@ async fn async_main(command: Option<Commands>) -> Result<()> {
         Some(Commands::Jupyter { command }) => jupyter_command(command).await?,
         Some(Commands::Daemon { command }) => daemon_command(command).await?,
         Some(Commands::Notebooks { json }) => list_notebooks(json).await?,
+        Some(Commands::Shutdown { path }) => shutdown_notebook(&path).await?,
         Some(Commands::Inspect {
             path,
             full_outputs,
@@ -1813,6 +1819,54 @@ async fn list_notebooks(json_output: bool) -> Result<()> {
     Ok(())
 }
 
+/// Shutdown a notebook's kernel and evict its room from the daemon.
+async fn shutdown_notebook(path: &PathBuf) -> Result<()> {
+    use runtimed::client::PoolClient;
+    use runtimed::singleton::get_running_daemon_info;
+
+    let path_str = path.to_string_lossy();
+
+    // Check if it's a valid UUID (untitled notebook ID)
+    let is_uuid = uuid::Uuid::parse_str(&path_str).is_ok();
+
+    let notebook_id = if is_uuid {
+        // Use UUID directly for untitled notebooks
+        path_str.to_string()
+    } else {
+        // Convert to absolute path for file-based notebooks
+        let notebook_path = if path.is_absolute() {
+            path.clone()
+        } else {
+            std::env::current_dir()?.join(path)
+        };
+        notebook_path.to_string_lossy().to_string()
+    };
+
+    // Use daemon's actual endpoint if available
+    let client = match get_running_daemon_info() {
+        Some(info) => PoolClient::new(PathBuf::from(&info.endpoint)),
+        None => PoolClient::default(),
+    };
+
+    match client.shutdown_notebook(&notebook_id).await {
+        Ok(true) => {
+            println!("Shutdown notebook: {}", notebook_id);
+        }
+        Ok(false) => {
+            eprintln!("Notebook not found: {}", notebook_id);
+            eprintln!("Use 'runt notebooks' to see open notebooks.");
+            std::process::exit(1)
+        }
+        Err(e) => {
+            eprintln!("Failed to shutdown notebook: {}", e);
+            eprintln!("Is the daemon running? Try 'runt daemon status'");
+            std::process::exit(1)
+        }
+    }
+
+    Ok(())
+}
+
 // =============================================================================
 // Notebook inspection commands (debug tools)
 // =============================================================================
@@ -2106,4 +2160,32 @@ async fn debug_session(
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Test that the shutdown command correctly identifies UUIDs vs file paths.
+    /// This is critical for handling both saved notebooks (paths) and untitled
+    /// notebooks (UUIDs).
+    #[test]
+    fn test_shutdown_uuid_detection() {
+        // Valid UUIDs should be detected
+        assert!(uuid::Uuid::parse_str("ea56af47-d8f2-4823-b0eb-a6254338e244").is_ok());
+        assert!(uuid::Uuid::parse_str("d3058b85-2618-4211-85fd-7c657f9ac3a4").is_ok());
+
+        // File paths should NOT be detected as UUIDs
+        assert!(uuid::Uuid::parse_str("notebook.ipynb").is_err());
+        assert!(uuid::Uuid::parse_str("my-notebook.ipynb").is_err());
+        assert!(uuid::Uuid::parse_str("path/to/notebook.ipynb").is_err());
+        assert!(uuid::Uuid::parse_str("/absolute/path/notebook.ipynb").is_err());
+        assert!(uuid::Uuid::parse_str("./relative/notebook.ipynb").is_err());
+        assert!(uuid::Uuid::parse_str("../parent/notebook.ipynb").is_err());
+
+        // Edge cases
+        assert!(uuid::Uuid::parse_str("").is_err());
+        assert!(uuid::Uuid::parse_str("not-a-uuid").is_err());
+        assert!(uuid::Uuid::parse_str("12345").is_err());
+    }
 }
