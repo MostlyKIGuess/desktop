@@ -117,6 +117,8 @@ function AppContent() {
   const [showIsolationTest, setShowIsolationTest] = useState(false);
   const [trustDialogOpen, setTrustDialogOpen] = useState(false);
   const [clearingDeps, setClearingDeps] = useState(false);
+  // Track when sync/restart just completed for success feedback
+  const [justSynced, setJustSynced] = useState(false);
 
   // Daemon startup status (installing, starting, failed, etc.)
   const [daemonStatus, setDaemonStatus] = useState<DaemonStatus>(null);
@@ -144,6 +146,13 @@ function AppContent() {
       setRuntime(r as "python" | "deno");
     });
   }, []);
+
+  // Auto-clear justSynced after 3 seconds
+  useEffect(() => {
+    if (!justSynced) return;
+    const timer = setTimeout(() => setJustSynced(false), 3000);
+    return () => clearTimeout(timer);
+  }, [justSynced]);
 
   // Page payload state: maps cell_id -> payload (transient, not saved)
   const [pagePayloads, setPagePayloads] = useState<
@@ -330,6 +339,15 @@ function AppContent() {
   // Environment preparation progress
   const envProgress = useEnvProgress();
 
+  // Reset progress error when dependencies change (allows retry after fixing issues)
+  const progressError = envProgress.error;
+  const progressReset = envProgress.reset;
+  useEffect(() => {
+    if (envSyncState && !envSyncState.inSync && progressError) {
+      progressReset();
+    }
+  }, [envSyncState, progressError, progressReset]);
+
   // Derive sync state from daemon's envSyncState for inline environments
   // This overrides the disabled syncState from useDependencies/useCondaDependencies
   // Also shows for prewarmed kernels when user adds inline deps (prewarmed→inline drift)
@@ -403,6 +421,9 @@ function AppContent() {
   // Handler to sync deps - tries hot-sync for UV additions, falls back to restart
   // Always checks trust before any operation that installs packages
   const handleSyncDeps = useCallback(async (): Promise<boolean> => {
+    // Reset any previous error state before attempting
+    envProgress.reset();
+
     // Check trust first - required before any package installation (hot-sync or restart)
     const info = await checkTrust();
     if (!info) return false;
@@ -425,7 +446,8 @@ function AppContent() {
       const response = await syncEnvironment();
 
       if (response.result === "sync_environment_complete") {
-        logger.debug("[App] Hot-sync succeeded");
+        logger.debug("[App] Hot-sync succeeded:", response.synced_packages);
+        setJustSynced(true);
         return true;
       }
 
@@ -444,10 +466,15 @@ function AppContent() {
 
     // Restart flow - deps are already trusted from check above
     await shutdownKernel();
-    return tryStartKernel();
+    const started = await tryStartKernel();
+    if (started) {
+      setJustSynced(true);
+    }
+    return started;
   }, [
     envSource,
     envSyncState,
+    envProgress,
     syncEnvironment,
     checkTrust,
     shutdownKernel,
@@ -970,6 +997,7 @@ function AppContent() {
           syncState={denoDerivedSyncState}
           syncing={kernelStatus === "starting"}
           onSyncNow={handleSyncDeps}
+          justSynced={justSynced}
         />
       )}
       {dependencyHeaderOpen && runtime === "python" && envType === "conda" && (
@@ -993,6 +1021,7 @@ function AppContent() {
           environmentYmlDeps={environmentYmlDeps}
           pixiInfo={pixiInfo}
           onImportFromPixi={importFromPixi}
+          justSynced={justSynced}
         />
       )}
       {dependencyHeaderOpen && runtime === "python" && envType !== "conda" && (
@@ -1012,6 +1041,7 @@ function AppContent() {
           onImportFromPyproject={importFromPyproject}
           onUseProjectEnv={handleStartKernelWithPyproject}
           isUsingProjectEnv={envSource === "uv:pyproject"}
+          justSynced={justSynced}
         />
       )}
       {globalFind.isOpen && (
