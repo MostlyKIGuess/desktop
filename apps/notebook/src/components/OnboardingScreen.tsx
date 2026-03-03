@@ -12,7 +12,7 @@ type Runtime = "python" | "deno";
 type PythonEnv = "uv" | "conda";
 
 interface OnboardingScreenProps {
-  onComplete: () => void | Promise<void>;
+  onComplete: (runtime: string, pythonEnv: string) => void | Promise<void>;
 }
 
 type SetupStep = {
@@ -299,6 +299,7 @@ export function OnboardingScreen({ onComplete }: OnboardingScreenProps) {
     if (!daemonReady || !poolReady) return;
 
     try {
+      // Save settings to daemon
       await invoke("set_synced_setting", {
         key: "default_runtime",
         value: runtime,
@@ -312,20 +313,30 @@ export function OnboardingScreen({ onComplete }: OnboardingScreenProps) {
         value: true,
       });
 
+      // Show completing state while we create the notebook window
       setSetupComplete(true);
-      setTimeout(() => {
-        onComplete();
-      }, 500);
+
+      // Pass selected values directly to avoid settings race condition
+      // Await onComplete so we can handle failures properly
+      try {
+        await onComplete(runtime, pythonEnv);
+        // Window closes itself on success - no further action needed
+      } catch (completeError) {
+        // onComplete failed - reset state so user can retry
+        console.error("Failed to complete onboarding:", completeError);
+        setSetupComplete(false);
+        setErrorMessage("Failed to create notebook window. Please try again.");
+      }
     } catch (e) {
       console.error("Failed to save onboarding settings:", e);
       setErrorMessage("Failed to save settings. Please try again.");
     }
   }, [daemonReady, poolReady, runtime, pythonEnv, onComplete]);
 
-  // Skip onboarding when daemon failed
+  // Skip onboarding when daemon failed - use current selections or defaults
   const handleSkip = useCallback(async () => {
-    await onComplete();
-  }, [onComplete]);
+    await onComplete(runtime ?? "python", pythonEnv ?? "uv");
+  }, [onComplete, runtime, pythonEnv]);
 
   const completedSteps = steps.filter((s) => s.status === "completed").length;
   const totalSteps = steps.length;
