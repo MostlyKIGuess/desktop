@@ -136,7 +136,7 @@ fn random_tagline() -> String {
         "{}\n{} {} {}\n{}",
         "╭─".purple(),
         "│".purple(),
-        "Runt:".purple().bold(),
+        "runt:".purple().bold(),
         TAGLINES[index],
         "╰─".purple()
     )
@@ -157,7 +157,8 @@ fn is_dev_mode() -> bool {
 #[derive(Subcommand)]
 enum Commands {
     /// Open the notebook application
-    Notebook {
+    #[command(alias = "notebook")]
+    Open {
         /// Path to notebook file or directory to open
         path: Option<PathBuf>,
         /// Runtime for new notebooks (python, deno)
@@ -165,6 +166,7 @@ enum Commands {
         runtime: Option<String>,
     },
     /// Jupyter kernel utilities
+    #[command(hide = true)]
     Jupyter {
         #[command(subcommand)]
         command: JupyterCommands,
@@ -175,14 +177,15 @@ enum Commands {
         command: DaemonCommands,
     },
     /// List open notebooks with kernel and peer info
-    #[command(alias = "ps")]
-    Notebooks {
+    #[command(alias = "notebooks")]
+    Ps {
         /// Output in JSON format
         #[arg(long)]
         json: bool,
     },
-    /// Shutdown a notebook's kernel and evict its room
-    Shutdown {
+    /// Stop a notebook's kernel and evict its room
+    #[command(alias = "shutdown")]
+    Stop {
         /// Path to the notebook file, or notebook ID (UUID) for untitled notebooks
         path: PathBuf,
     },
@@ -259,8 +262,8 @@ enum Commands {
     #[command(hide = true)]
     Start { name: String },
     /// [DEPRECATED] Use 'runt jupyter stop' instead
-    #[command(hide = true)]
-    Stop {
+    #[command(hide = true, name = "stop-kernel")]
+    StopKernel {
         id: Option<String>,
         #[arg(long)]
         all: bool,
@@ -504,8 +507,8 @@ fn main() -> Result<()> {
             eprintln!("Warning: 'runt sidecar' is deprecated. Use 'runt jupyter sidecar' instead.");
             sidecar::launch(&file, quiet, dump.as_deref())
         }
-        // Notebook launches the desktop app (no tokio needed)
-        Some(Commands::Notebook { path, runtime }) => open_notebook(path, runtime),
+        // Open launches the desktop app (no tokio needed)
+        Some(Commands::Open { path, runtime }) => open_notebook(path, runtime),
         // All other subcommands use tokio
         other => {
             let rt = tokio::runtime::Runtime::new()?;
@@ -643,11 +646,11 @@ fn open_notebook(path: Option<PathBuf>, runtime: Option<String>) -> Result<()> {
 async fn async_main(command: Option<Commands>) -> Result<()> {
     match command {
         // Primary commands
-        Some(Commands::Notebook { .. }) => unreachable!(), // handled in main()
+        Some(Commands::Open { .. }) => unreachable!(), // handled in main()
         Some(Commands::Jupyter { command }) => jupyter_command(command).await?,
         Some(Commands::Daemon { command }) => daemon_command(command).await?,
-        Some(Commands::Notebooks { json }) => list_notebooks(json).await?,
-        Some(Commands::Shutdown { path }) => shutdown_notebook(&path).await?,
+        Some(Commands::Ps { json }) => list_notebooks(json).await?,
+        Some(Commands::Stop { path }) => shutdown_notebook(&path).await?,
         Some(Commands::Inspect {
             path,
             full_outputs,
@@ -696,8 +699,10 @@ async fn async_main(command: Option<Commands>) -> Result<()> {
             eprintln!("Warning: 'runt start' is deprecated. Use 'runt jupyter start' instead.");
             start_kernel(&name).await?
         }
-        Some(Commands::Stop { id, all }) => {
-            eprintln!("Warning: 'runt stop' is deprecated. Use 'runt jupyter stop' instead.");
+        Some(Commands::StopKernel { id, all }) => {
+            eprintln!(
+                "Warning: 'runt stop-kernel' is deprecated. Use 'runt jupyter stop' instead."
+            );
             stop_kernels(id.as_deref(), all).await?
         }
         Some(Commands::Interrupt { id }) => {
@@ -1590,8 +1595,20 @@ async fn daemon_command(command: DaemonCommands) -> Result<()> {
             };
             let is_dev = runtimed::is_dev_mode();
 
+            // Get socket path from daemon info or default
+            let socket_path = daemon_info
+                .as_ref()
+                .map(|i| i.endpoint.clone())
+                .unwrap_or_else(|| {
+                    runtimed::default_socket_path()
+                        .to_string_lossy()
+                        .to_string()
+                });
+
             if json {
                 let output = serde_json::json!({
+                    "channel": runt_workspace::channel_display_name(),
+                    "socket_path": socket_path,
                     "installed": installed,
                     "running": running,
                     "dev_mode": is_dev,
@@ -1600,65 +1617,106 @@ async fn daemon_command(command: DaemonCommands) -> Result<()> {
                 });
                 println!("{}", serde_json::to_string_pretty(&output)?);
             } else {
-                let daemon_name = runt_workspace::daemon_service_basename();
-                println!("{} Daemon Status", daemon_name);
-                println!("======================");
+                use colored::Colorize;
+
+                let channel = runt_workspace::channel_display_name();
+
+                // Header with purple bracket style
+                print_header("runtimed", "Daemon Status");
+
+                // Channel and status
+                println!("{:<19} {}", "Channel:".bold(), channel.cyan());
                 println!(
-                    "Service installed: {}",
-                    if installed { "yes" } else { "no" }
+                    "{:<19} {}",
+                    "Service installed:".bold(),
+                    colored_yes_no(installed)
                 );
-                println!("Daemon running:    {}", if running { "yes" } else { "no" });
+                println!(
+                    "{:<19} {}",
+                    "Daemon running:".bold(),
+                    colored_yes_no(running)
+                );
+
+                // Socket path
+                println!(
+                    "{:<19} {}",
+                    "Socket:".bold(),
+                    shorten_path(&PathBuf::from(&socket_path)).dimmed()
+                );
 
                 // Show dev mode info
                 if is_dev {
-                    println!("Mode:              development");
+                    println!("{:<19} {}", "Mode:".bold(), "development".cyan());
                 }
                 if let Some(info) = &daemon_info {
                     if let Some(worktree) = &info.worktree_path {
                         println!(
-                            "Worktree:          {}",
-                            shorten_path(&PathBuf::from(worktree))
+                            "{:<19} {}",
+                            "Worktree:".bold(),
+                            shorten_path(&PathBuf::from(worktree)).dimmed()
                         );
                     }
                     if let Some(desc) = &info.workspace_description {
-                        println!("Description:       {}", desc);
+                        println!("{:<19} {}", "Description:".bold(), desc.cyan());
                     }
                 }
 
                 if let Some(info) = &daemon_info {
-                    println!("PID:               {}", info.pid);
-                    println!("Version:           {}", info.version);
+                    println!();
+                    println!("{:<19} {}", "PID:".bold(), info.pid);
+                    println!("{:<19} {}", "Version:".bold(), info.version);
                     if let Some(port) = info.blob_port {
-                        println!("Blob server:       http://127.0.0.1:{}", port);
+                        println!(
+                            "{:<19} {}",
+                            "Blob server:".bold(),
+                            format!("http://127.0.0.1:{}", port).cyan()
+                        );
                     }
                     let uptime = chrono::Utc::now() - info.started_at;
                     let hours = uptime.num_hours();
                     let mins = uptime.num_minutes() % 60;
-                    println!("Uptime:            {}h {}m", hours, mins);
+                    println!("{:<19} {}h {}m", "Uptime:".bold(), hours, mins);
                 }
 
                 if let Some(stats) = &stats {
                     println!();
-                    println!("Pool:");
+                    println!("{}", "Pool:".bold());
+
+                    let uv_total = stats.uv_available + stats.uv_warming;
+                    let uv_status = format!("{}/{} ready", stats.uv_available, uv_total);
+                    let uv_colored = if stats.uv_warming > 0 {
+                        uv_status.yellow()
+                    } else {
+                        uv_status.green()
+                    };
+                    let uv_warming_text = if stats.uv_warming > 0 {
+                        format!(" ({} warming)", stats.uv_warming)
+                            .dimmed()
+                            .to_string()
+                    } else {
+                        String::new()
+                    };
+                    println!("  {:<8} {}{}", "UV:".bold(), uv_colored, uv_warming_text);
+
+                    let conda_total = stats.conda_available + stats.conda_warming;
+                    let conda_status = format!("{}/{} ready", stats.conda_available, conda_total);
+                    let conda_colored = if stats.conda_warming > 0 {
+                        conda_status.yellow()
+                    } else {
+                        conda_status.green()
+                    };
+                    let conda_warming_text = if stats.conda_warming > 0 {
+                        format!(" ({} warming)", stats.conda_warming)
+                            .dimmed()
+                            .to_string()
+                    } else {
+                        String::new()
+                    };
                     println!(
-                        "  UV:    {}/{} ready{}",
-                        stats.uv_available,
-                        stats.uv_available + stats.uv_warming,
-                        if stats.uv_warming > 0 {
-                            format!(" ({} warming)", stats.uv_warming)
-                        } else {
-                            String::new()
-                        }
-                    );
-                    println!(
-                        "  Conda: {}/{} ready{}",
-                        stats.conda_available,
-                        stats.conda_available + stats.conda_warming,
-                        if stats.conda_warming > 0 {
-                            format!(" ({} warming)", stats.conda_warming)
-                        } else {
-                            String::new()
-                        }
+                        "  {:<8} {}{}",
+                        "Conda:".bold(),
+                        conda_colored,
+                        conda_warming_text
                     );
                 }
             }
@@ -2139,71 +2197,86 @@ async fn doctor_command(
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
-        println!("{} Health Check", runt_workspace::daemon_service_basename());
-        println!("=====================");
+        use colored::Colorize;
+
+        print_header("runtimed", "Health Check");
         println!(
-            "Installed binary:   {} {}",
-            report.installed_binary.path,
-            status_icon(&report.installed_binary.status)
+            "{:<20} {} {}",
+            "Installed binary:".bold(),
+            report.installed_binary.path.dimmed(),
+            colored_status_icon(&report.installed_binary.status)
         );
         println!(
-            "Service config:     {} {}",
-            report.service_config.path,
-            status_icon(&report.service_config.status)
+            "{:<20} {} {}",
+            "Service config:".bold(),
+            report.service_config.path.dimmed(),
+            colored_status_icon(&report.service_config.status)
         );
         if let Some(ref plist_check) = report.plist_home_env {
             println!(
-                "Plist HOME env:     {}{}",
-                status_icon(&plist_check.status),
+                "{:<20} {}{}",
+                "Plist HOME env:".bold(),
+                colored_status_icon(&plist_check.status),
                 plist_check
                     .detail
                     .as_ref()
-                    .map(|d| format!(" ({})", d))
+                    .map(|d| format!(" ({})", d).dimmed().to_string())
                     .unwrap_or_default()
             );
         }
         println!(
-            "Socket file:        {} {}",
-            report.socket_file.path,
-            status_icon(&report.socket_file.status)
+            "{:<20} {} {}",
+            "Socket file:".bold(),
+            report.socket_file.path.dimmed(),
+            colored_status_icon(&report.socket_file.status)
         );
         println!(
-            "Daemon state:       {} {}{}",
-            report.daemon_state.path,
-            status_icon(&report.daemon_state.status),
+            "{:<20} {} {}{}",
+            "Daemon state:".bold(),
+            report.daemon_state.path.dimmed(),
+            colored_status_icon(&report.daemon_state.status),
             report
                 .daemon_state
                 .detail
                 .as_ref()
-                .map(|d| format!(" ({})", d))
+                .map(|d| format!(" ({})", d).dimmed().to_string())
                 .unwrap_or_default()
         );
         println!(
-            "Daemon running:     {}{}",
-            if report.daemon_running.status == "ok" {
-                "yes"
-            } else {
-                "no"
-            },
+            "{:<20} {}{}",
+            "Daemon running:".bold(),
+            colored_yes_no(report.daemon_running.status == "ok"),
             report
                 .daemon_running
                 .detail
                 .as_ref()
-                .map(|d| format!(" ({})", d))
+                .map(|d| format!(" ({})", d).dimmed().to_string())
                 .unwrap_or_default()
         );
         println!();
-        println!("Diagnosis: {}", report.diagnosis);
+
+        // Color diagnosis based on health
+        let diagnosis_colored = if report.daemon_running.status == "ok" {
+            report.diagnosis.green()
+        } else if report.daemon_state.status == "stale" {
+            report.diagnosis.yellow()
+        } else {
+            report.diagnosis.red()
+        };
+        println!("{} {}", "Diagnosis:".bold(), diagnosis_colored);
 
         if !report.actions_taken.is_empty() {
             println!();
-            println!("Actions taken:");
+            println!("{}", "Actions taken:".bold());
             for action in &report.actions_taken {
-                println!("  - {}", action);
+                println!("  {} {}", "✓".green(), action);
             }
         } else if report.daemon_running.status != "ok" && !fix {
             println!();
-            println!("Run 'runt daemon doctor --fix' to attempt automatic repair.");
+            println!(
+                "{}",
+                "Run 'runt daemon doctor --fix' to attempt automatic repair.".cyan()
+            );
         }
     }
 
@@ -2325,15 +2398,40 @@ fn find_bundled_runtimed() -> Option<PathBuf> {
     None
 }
 
-/// Return a status icon for display
-fn status_icon(status: &str) -> &'static str {
+/// Return a colored status icon for display
+fn colored_status_icon(status: &str) -> colored::ColoredString {
+    use colored::Colorize;
     match status {
-        "ok" => "[ok]",
-        "missing" => "[missing]",
-        "stale" => "[stale]",
-        "not_running" => "",
-        _ => "[?]",
+        "ok" => "[ok]".green(),
+        "missing" => "[missing]".red(),
+        "stale" => "[stale]".yellow(),
+        "not_running" => "".normal(),
+        _ => "[?]".yellow(),
     }
+}
+
+/// Return a colored yes/no status
+fn colored_yes_no(value: bool) -> colored::ColoredString {
+    use colored::Colorize;
+    if value {
+        "yes".green()
+    } else {
+        "no".red()
+    }
+}
+
+/// Print a purple bracket header with colored prefix and regular suffix
+/// Example: print_header("runtimed", "Health Check") → "runtimed" purple, "Health Check" regular
+fn print_header(colored_prefix: &str, suffix: &str) {
+    use colored::Colorize;
+    println!("{}", "╭─".purple());
+    println!(
+        "{} {} {}",
+        "│".purple(),
+        colored_prefix.purple().bold(),
+        suffix
+    );
+    println!("{}", "╰─".purple());
 }
 
 /// Native log file tailing implementation
