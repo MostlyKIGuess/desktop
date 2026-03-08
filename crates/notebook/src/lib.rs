@@ -21,8 +21,9 @@ pub mod webdriver;
 
 pub use runtime::Runtime;
 
-use notebook_state::{FrontendCell, NotebookState};
-use runtimed::notebook_sync_client::{NotebookSyncClient, NotebookSyncHandle};
+use runtimed::notebook_sync_client::{
+    NotebookBroadcastReceiver, NotebookSyncClient, NotebookSyncHandle, NotebookSyncReceiver,
+};
 use runtimed::protocol::{CompletionItem, HistoryEntry, NotebookRequest, NotebookResponse};
 
 use log::{debug, info, warn};
@@ -37,8 +38,6 @@ type SharedNotebookSync = Arc<tokio::sync::Mutex<Option<NotebookSyncHandle>>>;
 
 #[derive(Clone)]
 struct WindowNotebookContext {
-    // TODO(phase-1.4): Remove once save is delegated to daemon
-    notebook_state: Arc<Mutex<NotebookState>>,
     notebook_sync: SharedNotebookSync,
     /// Generation counter to prevent stale broadcast tasks from clobbering new connections.
     /// Incremented each time initialize_notebook_sync is called.
@@ -52,6 +51,9 @@ struct WindowNotebookContext {
     /// Notebook ID for daemon sync — derived from path (saved) or env_id (untitled).
     /// Updated on save_notebook_as when path changes.
     notebook_id: Arc<Mutex<String>>,
+    /// Runtime type for this notebook (Python or Deno).
+    /// Used by session save so it doesn't need to read from NotebookState.
+    runtime: Runtime,
 }
 
 #[derive(Clone, Default)]
@@ -99,6 +101,34 @@ struct KernelspecInfo {
     language: String,
 }
 
+/// Payload emitted with the `daemon:ready` event after daemon-owned notebook loading.
+/// Carries notebook identity and trust status so the frontend can show loading state (#599)
+/// and trust prompts without additional round-trips.
+#[derive(Clone, Serialize)]
+struct DaemonReadyPayload {
+    notebook_id: String,
+    cell_count: usize,
+    needs_trust_approval: bool,
+}
+
+/// How to connect a new window to the daemon.
+enum OpenMode {
+    /// Open an existing notebook file. Daemon loads from disk.
+    Open { path: PathBuf },
+    /// Create a new empty notebook. Daemon generates notebook_id.
+    Create {
+        runtime: String,
+        working_dir: Option<PathBuf>,
+    },
+    /// Restore an untitled notebook by reconnecting to its existing daemon room.
+    /// Used for session restore when the notebook was never saved to disk.
+    /// The daemon may have the Automerge doc persisted from the previous session.
+    Restore {
+        notebook_id: String,
+        working_dir: Option<PathBuf>,
+    },
+}
+
 /// Git information for debug banner display.
 #[derive(Serialize)]
 struct GitInfo {
@@ -128,41 +158,6 @@ pub enum EnvSyncState {
         /// Dependencies synced but no longer declared
         removed: Vec<String>,
     },
-}
-
-/// Derive a notebook ID for sync purposes.
-///
-/// For saved notebooks, uses the canonical file path (stable across processes).
-/// For unsaved notebooks, uses the env_id from metadata (random UUID).
-fn derive_notebook_id(state: &NotebookState) -> String {
-    match &state.path {
-        Some(path) => {
-            // Use canonical path for deterministic ID across processes
-            path.canonicalize()
-                .unwrap_or_else(|_| path.clone())
-                .to_string_lossy()
-                .to_string()
-        }
-        None => {
-            // Unsaved notebook - use env_id from metadata (already generated)
-            state
-                .notebook
-                .metadata
-                .additional
-                .get("runt")
-                .and_then(|v| v.get("env_id"))
-                .and_then(|v| v.as_str())
-                .map(String::from)
-                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
-        }
-    }
-}
-
-fn notebook_state_for_window(
-    window: &tauri::Window,
-    registry: &WindowNotebookRegistry,
-) -> Result<Arc<Mutex<NotebookState>>, String> {
-    Ok(registry.get(window.label())?.notebook_state)
 }
 
 fn notebook_sync_for_window(
@@ -375,11 +370,15 @@ fn default_metadata_snapshot() -> runtimed::notebook_metadata::NotebookMetadataS
 /// For first-time connections (window creation), pass cells and metadata from the notebook.
 /// For reconnects (save_notebook_as, reconnect_to_daemon), pass empty cells - the daemon
 /// already has them and will send them during initial sync.
+/// Connect to the daemon using the legacy NotebookSync handshake.
+///
+/// Used only for restoring untitled notebooks by reconnecting to an existing
+/// daemon room via notebook_id (env_id). The daemon may have the Automerge doc
+/// persisted from a previous session. For saved notebooks, use
+/// `initialize_notebook_sync_open` instead.
 async fn initialize_notebook_sync(
     window: tauri::WebviewWindow,
     notebook_id: String,
-    initial_cells: Vec<FrontendCell>,
-    initial_metadata: Option<String>,
     notebook_sync: SharedNotebookSync,
     sync_generation: Arc<AtomicU64>,
     working_dir: Option<PathBuf>,
@@ -406,57 +405,16 @@ async fn initialize_notebook_sync(
             socket_path,
             notebook_id.clone(),
             working_dir,
-            initial_metadata.clone(),
+            None, // No initial metadata — daemon has the persisted doc
             Some(raw_sync_tx),
         )
         .await
         .map_err(|e| format!("sync connect: {}", e))?;
 
-    // Populate Automerge doc if empty (new room or first window)
-    if daemon_cells.is_empty() {
-        info!(
-            "[notebook-sync] Populating Automerge doc with {} cells",
-            initial_cells.len()
-        );
-        for (i, cell) in initial_cells.iter().enumerate() {
-            let (id, cell_type, source) = match cell {
-                FrontendCell::Code { id, source, .. } => (id.as_str(), "code", source.as_str()),
-                FrontendCell::Markdown { id, source } => (id.as_str(), "markdown", source.as_str()),
-                FrontendCell::Raw { id, source } => (id.as_str(), "raw", source.as_str()),
-            };
-            handle
-                .add_cell(i, id, cell_type)
-                .await
-                .map_err(|e| format!("add_cell: {}", e))?;
-            if !source.is_empty() {
-                handle
-                    .update_source(id, source)
-                    .await
-                    .map_err(|e| format!("update_source: {}", e))?;
-            }
-        }
-
-        // Also push notebook metadata to Automerge doc if provided
-        if let Some(ref metadata_json) = initial_metadata {
-            info!(
-                "[notebook-sync] Pushing metadata to Automerge doc for {}",
-                notebook_id
-            );
-            handle
-                .set_metadata(
-                    runtimed::notebook_metadata::NOTEBOOK_METADATA_KEY,
-                    metadata_json,
-                )
-                .await
-                .map_err(|e| format!("set_metadata: {}", e))?;
-        }
-    } else {
-        info!(
-            "[notebook-sync] Joining existing room with {} cells",
-            daemon_cells.len()
-        );
-        // No need to update local state - the frontend's WASM doc syncs directly with daemon
-    }
+    info!(
+        "[notebook-sync] Connected to room with {} cells",
+        daemon_cells.len()
+    );
 
     // Store the handle for commands to use
     info!(
@@ -615,6 +573,270 @@ async fn initialize_notebook_sync(
         window_for_ready.label(),
         "daemon:ready",
         (),
+    ) {
+        warn!("[notebook-sync] Failed to emit daemon:ready: {}", e);
+    }
+
+    Ok(())
+}
+
+/// Connect to the daemon by opening an existing notebook file.
+///
+/// The daemon loads the file, derives notebook_id, creates the room, and populates
+/// the Automerge doc. Returns after sync is established and `daemon:ready` is emitted.
+async fn initialize_notebook_sync_open(
+    window: tauri::WebviewWindow,
+    path: PathBuf,
+    notebook_sync: SharedNotebookSync,
+    sync_generation: Arc<AtomicU64>,
+    notebook_id: Arc<Mutex<String>>,
+) -> Result<(), String> {
+    let current_generation = sync_generation.fetch_add(1, Ordering::SeqCst) + 1;
+
+    let socket_path = runtimed::default_socket_path();
+    info!(
+        "[notebook-sync] Opening notebook via daemon: {} ({})",
+        path.display(),
+        socket_path.display(),
+    );
+
+    let (raw_sync_tx, raw_sync_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+
+    let (handle, receiver, broadcast_receiver, _cells, _metadata, info) =
+        NotebookSyncClient::connect_open_split(socket_path, path, Some(raw_sync_tx))
+            .await
+            .map_err(|e| format!("sync connect (open): {}", e))?;
+
+    info!(
+        "[notebook-sync] Daemon opened notebook: id={}, cells={}, trust_approval={}",
+        info.notebook_id, info.cell_count, info.needs_trust_approval,
+    );
+
+    // Update notebook_id with the daemon's canonical ID
+    if let Ok(mut id) = notebook_id.lock() {
+        *id = info.notebook_id.clone();
+    }
+
+    let ready_payload = DaemonReadyPayload {
+        notebook_id: info.notebook_id.clone(),
+        cell_count: info.cell_count,
+        needs_trust_approval: info.needs_trust_approval,
+    };
+
+    setup_sync_receivers(
+        window,
+        info.notebook_id,
+        handle,
+        receiver,
+        broadcast_receiver,
+        raw_sync_rx,
+        notebook_sync,
+        sync_generation,
+        current_generation,
+        ready_payload,
+    )
+    .await
+}
+
+/// Connect to the daemon by creating a new empty notebook.
+///
+/// The daemon creates an empty notebook with one code cell, generates a notebook_id
+/// (UUID/env_id), and returns it. Returns after sync is established and `daemon:ready` is emitted.
+async fn initialize_notebook_sync_create(
+    window: tauri::WebviewWindow,
+    runtime: String,
+    working_dir: Option<PathBuf>,
+    notebook_sync: SharedNotebookSync,
+    sync_generation: Arc<AtomicU64>,
+    notebook_id: Arc<Mutex<String>>,
+) -> Result<(), String> {
+    let current_generation = sync_generation.fetch_add(1, Ordering::SeqCst) + 1;
+
+    let socket_path = runtimed::default_socket_path();
+    info!(
+        "[notebook-sync] Creating notebook via daemon: runtime={}, working_dir={:?} ({})",
+        runtime,
+        working_dir,
+        socket_path.display(),
+    );
+
+    let (raw_sync_tx, raw_sync_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+
+    let (handle, receiver, broadcast_receiver, _cells, _metadata, info) =
+        NotebookSyncClient::connect_create_split(
+            socket_path,
+            runtime,
+            working_dir,
+            Some(raw_sync_tx),
+        )
+        .await
+        .map_err(|e| format!("sync connect (create): {}", e))?;
+
+    info!(
+        "[notebook-sync] Daemon created notebook: id={}, cells={}",
+        info.notebook_id, info.cell_count,
+    );
+
+    // Update notebook_id with the daemon's generated UUID
+    if let Ok(mut id) = notebook_id.lock() {
+        *id = info.notebook_id.clone();
+    }
+
+    let ready_payload = DaemonReadyPayload {
+        notebook_id: info.notebook_id.clone(),
+        cell_count: info.cell_count,
+        needs_trust_approval: info.needs_trust_approval,
+    };
+
+    setup_sync_receivers(
+        window,
+        info.notebook_id,
+        handle,
+        receiver,
+        broadcast_receiver,
+        raw_sync_rx,
+        notebook_sync,
+        sync_generation,
+        current_generation,
+        ready_payload,
+    )
+    .await
+}
+
+/// Store the sync handle and spawn relay tasks for an established daemon connection.
+///
+/// This is the common tail of `initialize_notebook_sync_open` and `_create`.
+/// It stores the handle, spawns the metadata/raw-sync/broadcast receiver tasks,
+/// and emits `daemon:ready` with the connection payload.
+#[allow(clippy::too_many_arguments)]
+async fn setup_sync_receivers(
+    window: tauri::WebviewWindow,
+    notebook_id: String,
+    handle: NotebookSyncHandle,
+    mut receiver: NotebookSyncReceiver,
+    mut broadcast_receiver: NotebookBroadcastReceiver,
+    mut raw_sync_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    notebook_sync: SharedNotebookSync,
+    sync_generation: Arc<AtomicU64>,
+    current_generation: u64,
+    ready_payload: DaemonReadyPayload,
+) -> Result<(), String> {
+    // Store the handle for commands to use
+    *notebook_sync.lock().await = Some(handle);
+    info!(
+        "[notebook-sync] Handle stored for {} (gen {})",
+        notebook_id, current_generation,
+    );
+
+    // Spawn receiver task — forwards metadata updates to frontend
+    let window_for_receiver = window.clone();
+    let notebook_id_for_receiver = notebook_id.clone();
+    tokio::spawn(async move {
+        while let Some(update) = receiver.recv().await {
+            if let Some(ref metadata_json) = update.notebook_metadata {
+                match serde_json::from_str::<runtimed::notebook_metadata::NotebookMetadataSnapshot>(
+                    metadata_json,
+                ) {
+                    Ok(_) => {
+                        if let Err(e) = emit_to_label::<_, _, _>(
+                            &window_for_receiver,
+                            window_for_receiver.label(),
+                            "notebook:metadata_updated",
+                            metadata_json,
+                        ) {
+                            warn!("[notebook-sync] Failed to emit metadata_updated: {}", e);
+                        }
+                    }
+                    Err(e) => {
+                        warn!("[notebook-sync] Failed to deserialize metadata: {}", e);
+                    }
+                }
+            }
+        }
+        info!(
+            "[notebook-sync] Receiver loop ended for {}",
+            notebook_id_for_receiver,
+        );
+    });
+
+    // Spawn raw sync relay task — forwards Automerge sync messages to frontend WASM
+    let window_for_raw_sync = window.clone();
+    let notebook_id_for_raw_sync = notebook_id.clone();
+    tokio::spawn(async move {
+        while let Some(sync_bytes) = raw_sync_rx.recv().await {
+            if let Err(e) = emit_to_label::<_, _, _>(
+                &window_for_raw_sync,
+                window_for_raw_sync.label(),
+                "automerge:from-daemon",
+                &sync_bytes,
+            ) {
+                warn!(
+                    "[notebook-sync] Failed to emit automerge:from-daemon: {}",
+                    e
+                );
+            }
+        }
+        info!(
+            "[notebook-sync] Raw sync relay ended for {}",
+            notebook_id_for_raw_sync,
+        );
+    });
+
+    // Spawn broadcast receiver task — forwards daemon kernel events to frontend.
+    // On disconnect, conditionally clears the handle using the generation counter
+    // to avoid clobbering a newer connection's handle.
+    let window_for_ready = window.clone();
+    let notebook_sync_for_disconnect = notebook_sync.clone();
+    let notebook_id_for_broadcast = notebook_id.clone();
+    let sync_generation_for_cleanup = sync_generation.clone();
+    tokio::spawn(async move {
+        while let Some(broadcast) = broadcast_receiver.recv().await {
+            debug!(
+                "[notebook-sync] Broadcast for {}: {:?}",
+                notebook_id_for_broadcast, broadcast,
+            );
+            if let Err(e) =
+                emit_to_label::<_, _, _>(&window, window.label(), "daemon:broadcast", &broadcast)
+            {
+                warn!("[notebook-sync] Failed to emit daemon:broadcast: {}", e);
+            }
+        }
+        warn!(
+            "[notebook-sync] Broadcast ended for {} (gen {}) — daemon disconnected",
+            notebook_id_for_broadcast, current_generation,
+        );
+
+        let current_gen = sync_generation_for_cleanup.load(Ordering::SeqCst);
+        if current_gen == current_generation {
+            info!(
+                "[notebook-sync] Clearing handle for {} (gen {})",
+                notebook_id_for_broadcast, current_generation,
+            );
+            *notebook_sync_for_disconnect.lock().await = None;
+            if let Err(e) =
+                emit_to_label::<_, _, _>(&window, window.label(), "daemon:disconnected", ())
+            {
+                warn!("[notebook-sync] Failed to emit daemon:disconnected: {}", e);
+            }
+        } else {
+            info!(
+                "[notebook-sync] Skipping cleanup for {} (gen {} != {})",
+                notebook_id_for_broadcast, current_generation, current_gen,
+            );
+        }
+    });
+
+    info!(
+        "[notebook-sync] Sync receivers established for {}",
+        notebook_id,
+    );
+
+    // Emit daemon:ready with connection info so frontend can show loading state / trust prompt
+    if let Err(e) = emit_to_label::<_, _, _>(
+        &window_for_ready,
+        window_for_ready.label(),
+        "daemon:ready",
+        &ready_payload,
     ) {
         warn!("[notebook-sync] Failed to emit daemon:ready: {}", e);
     }
@@ -1048,13 +1270,16 @@ async fn complete_onboarding(
     // Use notebooks directory as working directory for the new notebook
     let working_dir = ensure_notebooks_directory().ok();
 
-    // Create new notebook state with proper working directory
-    let mut state = NotebookState::new_empty_with_runtime(runtime);
-    state.working_dir = working_dir.clone();
-
-    // Create the notebook window (this also initializes notebook sync via create_notebook_window)
-    // Note: state.working_dir is passed through to the daemon for project file detection
-    let label = create_notebook_window(&app, registry.inner(), state)?;
+    // Create the notebook window using daemon-owned creation
+    let label = create_notebook_window_for_daemon(
+        &app,
+        registry.inner(),
+        OpenMode::Create {
+            runtime: runtime.to_string(),
+            working_dir,
+        },
+        None,
+    )?;
     info!("[onboarding] Created notebook window with label: {}", label);
 
     // Close the onboarding window (the one that called this command)
@@ -1155,7 +1380,6 @@ async fn save_notebook_as(
     window: tauri::Window,
     registry: tauri::State<'_, WindowNotebookRegistry>,
 ) -> Result<(), String> {
-    let state = notebook_state_for_window(&window, registry.inner())?;
     let notebook_sync = notebook_sync_for_window(&window, registry.inner())?;
     let sync_generation = sync_generation_for_window(&window, registry.inner())?;
     let context_path = path_for_window(&window, registry.inner())?;
@@ -1195,84 +1419,18 @@ async fn save_notebook_as(
         .unwrap_or("Untitled.ipynb");
     let _ = window.set_title(filename);
 
-    // Derive new notebook_id from saved path (canonical path)
-    let new_notebook_id = saved_path
-        .canonicalize()
-        .unwrap_or_else(|_| saved_path.clone())
-        .to_string_lossy()
-        .to_string();
-
-    // Update context.path, notebook_id (authoritative) and mark as clean
+    // Update context.path and mark as clean
     if let Ok(mut p) = context_path.lock() {
         *p = Some(saved_path.clone());
     }
-    let context_notebook_id = notebook_id_for_window(&window, registry.inner())?;
-    if let Ok(mut id) = context_notebook_id.lock() {
-        *id = new_notebook_id.clone();
-    }
     dirty.store(false, Ordering::SeqCst);
-
-    // Keep notebook_state.path in sync for session restore
-    {
-        let mut nb = state.lock().map_err(|e| e.to_string())?;
-        nb.path = Some(saved_path.clone());
-    }
 
     refresh_native_menu(window.app_handle(), registry.inner());
 
     // Reconnect to the daemon with the new path-based room ID.
-    // This ensures realtime sync uses the correct file path as the room identifier.
+    // The daemon just saved the file, so OpenNotebook will load it right back.
+    // No need to carry cells across — the daemon has them on disk.
     info!("[save-as] Reconnecting to room for new path");
-
-    // Read cells and metadata from the old room BEFORE disconnecting.
-    // The new room won't have these yet (it's a different notebook_id), so we need
-    // to carry them across to populate the new room if it's empty.
-    let (cells_for_reconnect, metadata_for_reconnect) = {
-        let sync_guard = notebook_sync.lock().await;
-        if let Some(handle) = sync_guard.as_ref() {
-            let cells = handle
-                .get_cells()
-                .await
-                .unwrap_or_default()
-                .into_iter()
-                .map(|snap| {
-                    // Convert CellSnapshot to FrontendCell for init_sync
-                    match snap.cell_type.as_str() {
-                        "code" => FrontendCell::Code {
-                            id: snap.id,
-                            source: snap.source,
-                            execution_count: snap
-                                .execution_count
-                                .parse()
-                                .ok()
-                                .filter(|&n: &i32| n > 0),
-                            outputs: snap
-                                .outputs
-                                .into_iter()
-                                .filter_map(|s| serde_json::from_str(&s).ok())
-                                .collect(),
-                        },
-                        "markdown" => FrontendCell::Markdown {
-                            id: snap.id,
-                            source: snap.source,
-                        },
-                        _ => FrontendCell::Raw {
-                            id: snap.id,
-                            source: snap.source,
-                        },
-                    }
-                })
-                .collect::<Vec<_>>();
-            let metadata = handle
-                .get_metadata(runtimed::notebook_metadata::NOTEBOOK_METADATA_KEY)
-                .await
-                .ok()
-                .flatten();
-            (cells, metadata)
-        } else {
-            (vec![], None)
-        }
-    };
 
     // Clear the existing sync handle to disconnect from the old room
     {
@@ -1280,23 +1438,20 @@ async fn save_notebook_as(
         *sync_guard = None;
     }
 
-    // Reconnect with the new path-based room ID.
-    // We don't fail the save if reconnect fails - the file was already written successfully.
-    // Pass cells/metadata from the old room in case the new room is empty (it will be,
-    // since the notebook_id changed).
+    // Reconnect via daemon-owned open. The daemon loads the file it just saved,
+    // creating a new room keyed by the canonical path.
+    // We don't fail the save if reconnect fails — the file was already written.
+    let notebook_id = notebook_id_for_window(&window, registry.inner())?;
     let webview_window = window
         .app_handle()
         .get_webview_window(window.label())
         .ok_or_else(|| "Current webview window not found".to_string())?;
-    // Saved notebooks have a path, so no working_dir needed for project detection
-    if let Err(e) = initialize_notebook_sync(
+    if let Err(e) = initialize_notebook_sync_open(
         webview_window,
-        new_notebook_id,
-        cells_for_reconnect,
-        metadata_for_reconnect,
+        saved_path,
         notebook_sync,
         sync_generation,
-        None,
+        notebook_id,
     )
     .await
     {
@@ -1344,60 +1499,79 @@ async fn open_notebook_in_new_window(
     open_notebook_window(&app, registry.inner(), Path::new(&path))
 }
 
-fn create_notebook_window(
+/// Create a notebook window using daemon-owned loading.
+///
+/// The window is created immediately (with a loading state). The daemon connection
+/// happens asynchronously — `notebook_id` is updated when the daemon responds.
+fn create_notebook_window_for_daemon(
     app: &tauri::AppHandle,
     registry: &WindowNotebookRegistry,
-    state: NotebookState,
-) -> Result<String, String> {
-    create_notebook_window_with_label(app, registry, state, None)
-}
-
-fn create_notebook_window_with_label(
-    app: &tauri::AppHandle,
-    registry: &WindowNotebookRegistry,
-    state: NotebookState,
+    mode: OpenMode,
     custom_label: Option<String>,
 ) -> Result<String, String> {
-    let title = state
-        .path
-        .as_ref()
-        .and_then(|p| p.file_name())
-        .and_then(|n| n.to_str())
-        .unwrap_or("Untitled.ipynb")
-        .to_string();
-
-    // Use custom label if provided, otherwise generate a deterministic one
-    let label = custom_label.unwrap_or_else(|| {
-        // Generate stable label based on path or env_id for window-state plugin
-        if let Some(path) = &state.path {
-            let hash = runtimed::worktree_hash(path);
-            format!("notebook-{}", &hash[..8])
-        } else {
-            // For untitled notebooks, use env_id if available
-            let env_id = state
-                .notebook
-                .metadata
-                .additional
-                .get("runt")
-                .and_then(|v| v.get("env_id"))
-                .and_then(|v| v.as_str());
-            if let Some(id) = env_id {
-                format!("notebook-{}", &id[..8.min(id.len())])
-            } else {
-                format!("notebook-{}", uuid::Uuid::new_v4())
-            }
+    // Extract window metadata from the mode
+    let (title, path, working_dir, runtime) = match &mode {
+        OpenMode::Open { path } => {
+            let title = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("Untitled.ipynb")
+                .to_string();
+            let runtime = settings::load_settings().default_runtime;
+            (title, Some(path.clone()), None, runtime)
         }
-    });
-    // Extract data for sync initialization before moving state into context
-    let working_dir = state.working_dir.clone();
-    let notebook_id = derive_notebook_id(&state);
-    let initial_cells = state.cells_for_frontend();
-    let initial_metadata = {
-        let snapshot = notebook_state::snapshot_from_nbformat(&state.notebook.metadata);
-        serde_json::to_string(&snapshot).ok()
+        OpenMode::Create {
+            runtime,
+            working_dir,
+        } => {
+            let runtime_enum: Runtime = runtime.parse().unwrap_or(Runtime::Python);
+            (
+                "Untitled.ipynb".to_string(),
+                None,
+                working_dir.clone(),
+                runtime_enum,
+            )
+        }
+        OpenMode::Restore {
+            notebook_id: _,
+            working_dir,
+        } => {
+            let runtime = settings::load_settings().default_runtime;
+            (
+                "Untitled.ipynb".to_string(),
+                None,
+                working_dir.clone(),
+                runtime,
+            )
+        }
     };
 
-    let context = create_window_context(state);
+    // Generate a stable window label for the window-state plugin
+    let label = custom_label.unwrap_or_else(|| {
+        if let OpenMode::Restore { notebook_id, .. } = &mode {
+            format!("notebook-{}", &notebook_id[..8.min(notebook_id.len())])
+        } else if let Some(ref p) = path {
+            let hash = runtimed::worktree_hash(p);
+            format!("notebook-{}", &hash[..8])
+        } else {
+            format!("notebook-{}", uuid::Uuid::new_v4())
+        }
+    });
+
+    // Placeholder notebook_id — daemon will provide the canonical one.
+    // Must derive from mode, not just path, because Restore carries its own notebook_id.
+    let placeholder_id = match &mode {
+        OpenMode::Open { path } => path
+            .canonicalize()
+            .unwrap_or_else(|_| path.clone())
+            .to_string_lossy()
+            .to_string(),
+        OpenMode::Restore { notebook_id, .. } => notebook_id.clone(),
+        OpenMode::Create { .. } => String::new(),
+    };
+
+    let context =
+        create_window_context_for_daemon(path, working_dir.clone(), placeholder_id, runtime);
     registry.insert(label.clone(), context.clone())?;
 
     let window =
@@ -1415,27 +1589,58 @@ fn create_notebook_window_with_label(
             }
         };
 
-    let context = registry.get(&label)?;
+    // Spawn async daemon connection — window shows loading state until daemon:ready
+    let notebook_sync = context.notebook_sync;
+    let sync_generation = context.sync_generation;
+    let notebook_id_arc = context.notebook_id;
     tauri::async_runtime::spawn(async move {
-        // Pass working_dir for project file detection (pyproject.toml, environment.yml, etc.)
-        // For notebooks with a path, the daemon uses the path; for untitled, it uses working_dir
-        if let Err(e) = initialize_notebook_sync(
-            window,
-            notebook_id,
-            initial_cells,
-            initial_metadata,
-            context.notebook_sync,
-            context.sync_generation,
-            working_dir,
-        )
-        .await
-        {
-            warn!("[startup] Notebook sync initialization failed: {}", e);
+        let result = match mode {
+            OpenMode::Open { path } => {
+                initialize_notebook_sync_open(
+                    window,
+                    path,
+                    notebook_sync,
+                    sync_generation,
+                    notebook_id_arc,
+                )
+                .await
+            }
+            OpenMode::Create {
+                runtime,
+                working_dir,
+            } => {
+                initialize_notebook_sync_create(
+                    window,
+                    runtime,
+                    working_dir,
+                    notebook_sync,
+                    sync_generation,
+                    notebook_id_arc,
+                )
+                .await
+            }
+            OpenMode::Restore {
+                notebook_id,
+                working_dir,
+            } => {
+                // Reconnect to existing daemon room using the old handshake.
+                // The daemon may have the Automerge doc persisted from a previous session.
+                initialize_notebook_sync(
+                    window,
+                    notebook_id,
+                    notebook_sync,
+                    sync_generation,
+                    working_dir,
+                )
+                .await
+            }
+        };
+        if let Err(e) = result {
+            warn!("[startup] Daemon notebook sync failed: {}", e);
         }
     });
 
     refresh_native_menu(app, registry);
-
     Ok(label)
 }
 
@@ -1444,9 +1649,15 @@ fn open_notebook_window(
     registry: &WindowNotebookRegistry,
     path: &Path,
 ) -> Result<(), String> {
-    let runtime = settings::load_settings().default_runtime;
-    let state = load_notebook_state_for_path(path, runtime)?;
-    create_notebook_window(app, registry, state).map(|_| ())
+    create_notebook_window_for_daemon(
+        app,
+        registry,
+        OpenMode::Open {
+            path: path.to_path_buf(),
+        },
+        None,
+    )
+    .map(|_| ())
 }
 
 fn next_available_sample_path(base_dir: &Path, file_name: &str) -> PathBuf {
@@ -1878,7 +2089,10 @@ async fn reconnect_to_daemon(
     let notebook_sync = notebook_sync_for_window(&window, registry.inner())?;
     let sync_generation = sync_generation_for_window(&window, registry.inner())?;
     let working_dir = working_dir_for_window(&window, registry.inner())?;
+    let context_path = path_for_window(&window, registry.inner())?;
     let context_notebook_id = notebook_id_for_window(&window, registry.inner())?;
+
+    let path = context_path.lock().map_err(|e| e.to_string())?.clone();
     let notebook_id = context_notebook_id
         .lock()
         .map_err(|e| e.to_string())?
@@ -1907,23 +2121,41 @@ async fn reconnect_to_daemon(
         }
     }
 
-    // Re-initialize notebook sync.
-    // The daemon persists notebook docs, so it should have the cells.
-    // Pass empty cells - daemon sends them during initial sync.
     let webview_window = window
         .app_handle()
         .get_webview_window(window.label())
         .ok_or_else(|| "Current webview window not found".to_string())?;
-    let result = initialize_notebook_sync(
-        webview_window,
-        notebook_id,
-        vec![], // Daemon persists cells, sends during initial sync
-        None,   // Daemon has metadata
-        notebook_sync,
-        sync_generation,
-        working_dir,
-    )
-    .await;
+
+    // For saved notebooks, use daemon-owned open (daemon reloads from disk).
+    // For untitled notebooks, use the old handshake with the notebook_id (env_id)
+    // so the daemon can find the persisted Automerge doc from the previous session.
+    let result = if let Some(p) = path {
+        info!(
+            "[daemon-kernel] Reconnecting via OpenNotebook: {}",
+            p.display()
+        );
+        initialize_notebook_sync_open(
+            webview_window,
+            p,
+            notebook_sync,
+            sync_generation,
+            context_notebook_id,
+        )
+        .await
+    } else {
+        info!(
+            "[daemon-kernel] Reconnecting untitled notebook: {}",
+            notebook_id
+        );
+        initialize_notebook_sync(
+            webview_window,
+            notebook_id,
+            notebook_sync,
+            sync_generation,
+            working_dir,
+        )
+        .await
+    };
 
     reset_flag();
     result
@@ -2561,8 +2793,16 @@ fn spawn_new_notebook(
     registry: &WindowNotebookRegistry,
     runtime: Runtime,
 ) -> Result<(), String> {
-    let state = NotebookState::new_empty_with_runtime(runtime);
-    create_notebook_window(app, registry, state).map(|_| ())
+    create_notebook_window_for_daemon(
+        app,
+        registry,
+        OpenMode::Create {
+            runtime: runtime.to_string(),
+            working_dir: None,
+        },
+        None,
+    )
+    .map(|_| ())
 }
 
 /// Ensure notebooks directory exists and return its path.
@@ -2669,80 +2909,25 @@ async fn run_settings_sync(app: tauri::AppHandle) {
 }
 
 /// Create initial notebook state for a new notebook, detecting project-level config for Python.
-fn create_new_notebook_state(path: &Path, runtime: Runtime) -> NotebookState {
-    // Only check project files for Python runtime
-    if runtime == Runtime::Python {
-        // Check pyproject.toml first (uv)
-        if let Some(pyproject_path) = pyproject::find_pyproject(path) {
-            if let Ok(config) = pyproject::parse_pyproject(&pyproject_path) {
-                info!(
-                    "New notebook at {}: detected pyproject.toml at {}, using UV",
-                    path.display(),
-                    pyproject_path.display()
-                );
-                let mut state = NotebookState::new_empty_with_uv_from_pyproject(&config);
-                state.path = Some(path.to_path_buf());
-                return state;
-            }
-        }
-
-        // Check environment.yml (conda)
-        if let Some(yml_path) = environment_yml::find_environment_yml(path) {
-            if let Ok(config) = environment_yml::parse_environment_yml(&yml_path) {
-                if !config.dependencies.is_empty() {
-                    info!(
-                        "New notebook at {}: detected environment.yml at {}, using conda",
-                        path.display(),
-                        yml_path.display()
-                    );
-                    let mut state =
-                        NotebookState::new_empty_with_conda_from_environment_yml(&config);
-                    state.path = Some(path.to_path_buf());
-                    return state;
-                }
-            }
-        }
-    }
-
-    // No project-level config found (or non-Python runtime) - use default
-    let mut state = NotebookState::new_empty_with_runtime(runtime);
-    state.path = Some(path.to_path_buf());
-    state
-}
-
-fn load_notebook_state_for_path(path: &Path, runtime: Runtime) -> Result<NotebookState, String> {
-    if path.exists() {
-        let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-        let nb = nbformat::parse_notebook(&content).map_err(|e| e.to_string())?;
-        let mut nb_v4 = match nb {
-            nbformat::Notebook::V4(nb) => nb,
-            nbformat::Notebook::Legacy(legacy) => {
-                nbformat::upgrade_legacy_notebook(legacy).map_err(|e| e.to_string())?
-            }
-            nbformat::Notebook::V3(v3) => {
-                nbformat::upgrade_v3_notebook(v3).map_err(|e| e.to_string())?
-            }
-        };
-        notebook_state::migrate_legacy_metadata(&mut nb_v4.metadata.additional);
-        Ok(NotebookState::from_notebook(nb_v4, path.to_path_buf()))
-    } else {
-        Ok(create_new_notebook_state(path, runtime))
-    }
-}
-
-fn create_window_context(state: NotebookState) -> WindowNotebookContext {
-    let path = state.path.clone();
-    let working_dir = state.working_dir.clone();
-    let dirty = state.dirty;
-    let notebook_id = derive_notebook_id(&state);
+/// Create a window context for daemon-owned notebook loading.
+///
+/// Unlike `create_window_context`, this doesn't require a fully-parsed `NotebookState`.
+/// The daemon owns the notebook content — Tauri just needs enough state for window management.
+/// The `notebook_id` starts as a placeholder and is updated after the daemon responds.
+fn create_window_context_for_daemon(
+    path: Option<PathBuf>,
+    working_dir: Option<PathBuf>,
+    placeholder_notebook_id: String,
+    runtime: Runtime,
+) -> WindowNotebookContext {
     WindowNotebookContext {
-        notebook_state: Arc::new(Mutex::new(state)),
         notebook_sync: Arc::new(tokio::sync::Mutex::new(None)),
         sync_generation: Arc::new(AtomicU64::new(0)),
         path: Arc::new(Mutex::new(path)),
         working_dir,
-        dirty: Arc::new(AtomicBool::new(dirty)),
-        notebook_id: Arc::new(Mutex::new(notebook_id)),
+        dirty: Arc::new(AtomicBool::new(false)),
+        notebook_id: Arc::new(Mutex::new(placeholder_notebook_id)),
+        runtime,
     }
 }
 
@@ -2836,61 +3021,107 @@ pub fn run(
     let window_registry = WindowNotebookRegistry::default();
 
     // Only set up initial notebook state if not showing onboarding
-    let (window_title, _main_context) = if needs_onboarding {
+    let (window_title, _main_context, main_open_mode) = if needs_onboarding {
         info!("[startup] Onboarding needed, skipping notebook state setup");
         // No main context - onboarding window doesn't need notebook state
         (
             format!("Welcome to {}", runt_workspace::desktop_display_name()),
             None,
+            None,
         )
     } else {
-        // Determine initial state for main window
-        let mut initial_state = match notebook_path.as_ref() {
+        // Determine how to open the main window — no local file parsing needed.
+        // The daemon loads/creates the notebook.
+        let (mode, title) = match notebook_path.as_ref() {
             Some(path) => {
-                load_notebook_state_for_path(path, runtime).map_err(anyhow::Error::msg)?
+                let title = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("Untitled.ipynb")
+                    .to_string();
+                (OpenMode::Open { path: path.clone() }, title)
             }
             None => {
-                // Try to restore from session
                 if let Some(ref session) = restored_session {
                     if let Some(main_session) = session.windows.iter().find(|w| w.label == "main") {
-                        match session::load_window_session_state(main_session) {
-                            Ok(state) => {
-                                info!("[session] Restored main window from session");
-                                state
+                        match (&main_session.path, &main_session.env_id) {
+                            (Some(path), _) if path.exists() => {
+                                let title = path
+                                    .file_name()
+                                    .and_then(|n| n.to_str())
+                                    .unwrap_or("Untitled.ipynb")
+                                    .to_string();
+                                info!(
+                                    "[session] Restoring main window from path: {}",
+                                    path.display()
+                                );
+                                (OpenMode::Open { path: path.clone() }, title)
                             }
-                            Err(e) => {
-                                warn!("[session] Failed to restore main window: {}", e);
-                                NotebookState::new_empty_with_runtime(runtime)
+                            (_, Some(env_id)) => {
+                                info!("[session] Restoring untitled main window: {}", env_id);
+                                (
+                                    OpenMode::Restore {
+                                        notebook_id: env_id.clone(),
+                                        working_dir: working_dir.clone(),
+                                    },
+                                    "Untitled.ipynb".to_string(),
+                                )
+                            }
+                            _ => {
+                                warn!("[session] Main session has no path or env_id");
+                                (
+                                    OpenMode::Create {
+                                        runtime: runtime.to_string(),
+                                        working_dir: working_dir.clone(),
+                                    },
+                                    "Untitled.ipynb".to_string(),
+                                )
                             }
                         }
                     } else {
-                        NotebookState::new_empty_with_runtime(runtime)
+                        (
+                            OpenMode::Create {
+                                runtime: runtime.to_string(),
+                                working_dir: working_dir.clone(),
+                            },
+                            "Untitled.ipynb".to_string(),
+                        )
                     }
                 } else {
-                    NotebookState::new_empty_with_runtime(runtime)
+                    (
+                        OpenMode::Create {
+                            runtime: runtime.to_string(),
+                            working_dir: working_dir.clone(),
+                        },
+                        "Untitled.ipynb".to_string(),
+                    )
                 }
             }
         };
-        // Store working_dir in notebook state for untitled notebooks (used on daemon reconnect)
-        if initial_state.path.is_none() {
-            initial_state.working_dir = working_dir.clone();
-        }
 
-        let title = match &initial_state.path {
-            Some(path) => path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("Untitled.ipynb")
+        let placeholder_id = match &mode {
+            OpenMode::Open { path } => path
+                .canonicalize()
+                .unwrap_or_else(|_| path.clone())
+                .to_string_lossy()
                 .to_string(),
-            None => "Untitled.ipynb".to_string(),
+            OpenMode::Restore { notebook_id, .. } => notebook_id.clone(),
+            OpenMode::Create { .. } => String::new(),
         };
-
-        let context = create_window_context(initial_state);
+        let context = create_window_context_for_daemon(
+            match &mode {
+                OpenMode::Open { path } => Some(path.clone()),
+                _ => None,
+            },
+            working_dir.clone(),
+            placeholder_id,
+            runtime,
+        );
         window_registry
             .insert("main", context.clone())
             .map_err(anyhow::Error::msg)?;
 
-        (title, Some(context))
+        (title, Some(context), Some(mode))
     };
 
     // Guard against concurrent reconnect attempts
@@ -3067,35 +3298,50 @@ pub fn run(
                     if window_session.label == "main" {
                         continue; // Already restored
                     }
-                    match session::load_window_session_state(window_session) {
-                        Ok(state) => {
-                            // Use deterministic label so window-state plugin can restore geometry
-                            let label = session::window_label_for_session(window_session);
-                            match create_notebook_window_with_label(
-                                app.handle(),
-                                &registry,
-                                state,
-                                Some(label.clone()),
-                            ) {
-                                Ok(created_label) => {
-                                    info!(
-                                        "[session] Restored additional window: {}",
-                                        created_label
-                                    );
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        "[session] Failed to create window for {}: {}",
-                                        label, e
-                                    );
-                                    restore_failed = true;
-                                }
+                    let label = session::window_label_for_session(window_session);
+                    let mode = match (&window_session.path, &window_session.env_id) {
+                        (Some(path), _) if path.exists() => {
+                            info!(
+                                "[session] Restoring window from path: {}",
+                                path.display()
+                            );
+                            OpenMode::Open { path: path.clone() }
+                        }
+                        (_, Some(env_id)) => {
+                            info!(
+                                "[session] Restoring untitled window: {}",
+                                env_id
+                            );
+                            OpenMode::Restore {
+                                notebook_id: env_id.clone(),
+                                working_dir: None,
                             }
+                        }
+                        _ => {
+                            let rt: Runtime =
+                                window_session.runtime.parse().unwrap_or(Runtime::Python);
+                            OpenMode::Create {
+                                runtime: rt.to_string(),
+                                working_dir: None,
+                            }
+                        }
+                    };
+                    match create_notebook_window_for_daemon(
+                        app.handle(),
+                        &registry,
+                        mode,
+                        Some(label.clone()),
+                    ) {
+                        Ok(created_label) => {
+                            info!(
+                                "[session] Restored additional window: {}",
+                                created_label
+                            );
                         }
                         Err(e) => {
                             warn!(
-                                "[session] Failed to load state for {}: {}",
-                                window_session.label, e
+                                "[session] Failed to create window for {}: {}",
+                                label, e
                             );
                             restore_failed = true;
                         }
@@ -3114,8 +3360,6 @@ pub fn run(
             let app_for_sync = app.handle().clone();
             let app_for_notebook_sync = app.handle().clone();
             let registry_for_notebook_sync = registry_for_sync.clone();
-            // Capture working_dir for untitled notebook project file detection
-            let working_dir_for_sync = working_dir.clone();
             let daemon_status_for_callback = daemon_status_for_startup.clone();
             // Capture for async block - onboarding doesn't need notebook sync
             let skip_notebook_sync = needs_onboarding;
@@ -3159,61 +3403,73 @@ pub fn run(
                 // Skip during onboarding - the onboarding window doesn't need notebook sync,
                 // it just needs daemon progress events
                 if daemon_available && !skip_notebook_sync {
-                    match (
-                        app_for_notebook_sync.get_webview_window("main"),
-                        registry_for_notebook_sync.get("main"),
-                    ) {
-                        (Some(window), Ok(context)) => {
-                            // Extract notebook_id, cells, metadata from context's NotebookState
-                            let sync_data = context.notebook_state.lock().ok().map(|state| {
-                                let id = derive_notebook_id(&state);
-                                let cells = state.cells_for_frontend();
-                                let metadata = {
-                                    let snapshot =
-                                        notebook_state::snapshot_from_nbformat(&state.notebook.metadata);
-                                    serde_json::to_string(&snapshot).ok()
+                    if let Some(mode) = main_open_mode {
+                        match (
+                            app_for_notebook_sync.get_webview_window("main"),
+                            registry_for_notebook_sync.get("main"),
+                        ) {
+                            (Some(window), Ok(context)) => {
+                                let result = match mode {
+                                    OpenMode::Open { path } => {
+                                        initialize_notebook_sync_open(
+                                            window,
+                                            path,
+                                            context.notebook_sync,
+                                            context.sync_generation,
+                                            context.notebook_id,
+                                        )
+                                        .await
+                                    }
+                                    OpenMode::Create {
+                                        runtime: rt,
+                                        working_dir: wd,
+                                    } => {
+                                        initialize_notebook_sync_create(
+                                            window,
+                                            rt,
+                                            wd,
+                                            context.notebook_sync,
+                                            context.sync_generation,
+                                            context.notebook_id,
+                                        )
+                                        .await
+                                    }
+                                    OpenMode::Restore {
+                                        notebook_id,
+                                        working_dir: wd,
+                                    } => {
+                                        initialize_notebook_sync(
+                                            window,
+                                            notebook_id,
+                                            context.notebook_sync,
+                                            context.sync_generation,
+                                            wd,
+                                        )
+                                        .await
+                                    }
                                 };
-                                (id, cells, metadata)
-                            });
-
-                            let Some((notebook_id, initial_cells, initial_metadata)) = sync_data
-                            else {
-                                log::warn!("[startup] Failed to lock notebook state for sync");
-                                daemon_sync_complete_for_init.store(true, Ordering::SeqCst);
-                                return;
-                            };
-
-                            match initialize_notebook_sync(
-                                window,
-                                notebook_id,
-                                initial_cells,
-                                initial_metadata,
-                                context.notebook_sync,
-                                context.sync_generation,
-                                working_dir_for_sync,
-                            )
-                            .await
-                            {
-                                Ok(()) => {
-                                    log::info!(
-                                        "[startup] Notebook sync initialized successfully"
-                                    );
-                                    daemon_sync_success_for_init
-                                        .store(true, Ordering::SeqCst);
-                                }
-                                Err(e) => {
-                                    log::warn!(
-                                        "[startup] Notebook sync initialization failed: {}",
-                                        e
-                                    );
+                                match result {
+                                    Ok(()) => {
+                                        log::info!(
+                                            "[startup] Notebook sync initialized successfully"
+                                        );
+                                        daemon_sync_success_for_init
+                                            .store(true, Ordering::SeqCst);
+                                    }
+                                    Err(e) => {
+                                        log::warn!(
+                                            "[startup] Notebook sync initialization failed: {}",
+                                            e
+                                        );
+                                    }
                                 }
                             }
-                        }
-                        (None, _) => {
-                            log::warn!("[startup] Main window missing during sync init");
-                        }
-                        (_, Err(e)) => {
-                            log::warn!("[startup] Main notebook context missing: {}", e);
+                            (None, _) => {
+                                log::warn!("[startup] Main window missing during sync init");
+                            }
+                            (_, Err(e)) => {
+                                log::warn!("[startup] Main notebook context missing: {}", e);
+                            }
                         }
                     }
                 } else if daemon_available && skip_notebook_sync {
@@ -3514,38 +3770,45 @@ pub fn run(
                     .unwrap_or(false);
 
                 if main_is_empty {
-                    match load_notebook_state_for_path(
-                        &path,
-                        settings::load_settings().default_runtime,
-                    ) {
-                        Ok(new_state) => {
-                            if let Ok(context) = registry_for_open.get("main") {
-                                // Update path
-                                if let Ok(mut p) = context.path.lock() {
-                                    *p = new_state.path.clone();
-                                }
-                                // Update notebook_state for save compatibility
-                                if let Ok(mut state) = context.notebook_state.lock() {
-                                    *state = new_state;
-                                }
-                            }
-
-                            if let Some(window) = app_handle.get_webview_window("main") {
-                                let title = path
-                                    .file_name()
-                                    .and_then(|n| n.to_str())
-                                    .unwrap_or("Untitled.ipynb");
-                                let _ = window.set_title(title);
-                                refresh_native_menu(app_handle, &registry_for_open);
-                                let _ = emit_to_label::<_, _, _>(
-                                    &window,
-                                    window.label(),
-                                    "notebook:file-opened",
-                                    (),
-                                );
-                            }
+                    // Reuse the empty main window — update path and reconnect to daemon
+                    if let Ok(context) = registry_for_open.get("main") {
+                        // Update path in context
+                        if let Ok(mut p) = context.path.lock() {
+                            *p = Some(path.clone());
                         }
-                        Err(e) => log::error!("Failed to load notebook file: {}", e),
+
+                        if let Some(window) = app_handle.get_webview_window("main") {
+                            let title = path
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("Untitled.ipynb");
+                            let _ = window.set_title(title);
+                            refresh_native_menu(app_handle, &registry_for_open);
+
+                            // Disconnect existing sync and reconnect with the file path
+                            let notebook_sync = context.notebook_sync.clone();
+                            let sync_generation = context.sync_generation.clone();
+                            let notebook_id = context.notebook_id.clone();
+                            let open_path = path.clone();
+                            tauri::async_runtime::spawn(async move {
+                                // Clear existing handle
+                                *notebook_sync.lock().await = None;
+                                if let Err(e) = initialize_notebook_sync_open(
+                                    window,
+                                    open_path,
+                                    notebook_sync,
+                                    sync_generation,
+                                    notebook_id,
+                                )
+                                .await
+                                {
+                                    log::error!(
+                                        "[file-open] Daemon sync failed for reused window: {}",
+                                        e
+                                    );
+                                }
+                            });
+                        }
                     }
                 } else if let Err(e) = open_notebook_window(app_handle, &registry_for_open, &path) {
                     log::error!("Failed to open notebook in new window: {}", e);
