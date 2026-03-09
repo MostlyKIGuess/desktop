@@ -51,6 +51,14 @@ pub fn default_log_path() -> PathBuf {
     daemon_base_dir().join("runtimed.log")
 }
 
+/// Get the daemon version string (e.g., "0.1.0-dev.10+abc123").
+/// Used for protocol version checking and debugging.
+/// Cached to avoid repeated allocations on hot paths.
+pub fn daemon_version() -> &'static str {
+    static VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    VERSION.get_or_init(|| format!("{}+{}", env!("CARGO_PKG_VERSION"), env!("GIT_COMMIT")))
+}
+
 // ============================================================================
 // Types
 // ============================================================================
