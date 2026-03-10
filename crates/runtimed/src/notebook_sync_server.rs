@@ -2647,33 +2647,12 @@ async fn save_notebook_to_disk(
         (cells, metadata_json)
     };
 
-    // Build existing cell metadata index (cell_id -> cell metadata from .ipynb)
-    let existing_cell_metadata: HashMap<String, serde_json::Value> = existing
-        .as_ref()
-        .and_then(|nb| nb.get("cells"))
-        .and_then(|c| c.as_array())
-        .map(|cells_arr| {
-            cells_arr
-                .iter()
-                .filter_map(|cell| {
-                    let id = cell.get("id").and_then(|v| v.as_str())?;
-                    let meta = cell
-                        .get("metadata")
-                        .cloned()
-                        .unwrap_or(serde_json::json!({}));
-                    Some((id.to_string(), meta))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
     // Reconstruct cells as JSON
+    // Cell metadata now comes from the CellSnapshot (populated during load)
     let mut nb_cells = Vec::new();
     for cell in &cells {
-        let cell_meta = existing_cell_metadata
-            .get(&cell.id)
-            .cloned()
-            .unwrap_or(serde_json::json!({}));
+        // Use metadata from the Automerge doc (populated during notebook load)
+        let cell_meta = cell.metadata.clone();
 
         // Parse source into multiline array format (split_inclusive('\n'))
         let source_lines: Vec<String> = if cell.source.is_empty() {
@@ -2805,35 +2784,30 @@ async fn clone_notebook_to_disk(room: &NotebookRoom, target_path: &str) -> Resul
         (doc.get_cells(), doc.get_metadata(NOTEBOOK_METADATA_KEY))
     };
 
-    // Read existing source notebook to preserve cell metadata and attachments
-    // (Automerge doc doesn't store these)
+    // Read existing source notebook to preserve attachments
+    // (cell metadata now comes from Automerge doc, attachments are not synced)
     let existing: Option<serde_json::Value> =
         match tokio::fs::read_to_string(&room.notebook_path).await {
             Ok(content) => serde_json::from_str(&content).ok(),
             Err(_) => None,
         };
 
-    // Build cell metadata/attachments index from existing notebook
-    let existing_cell_data: HashMap<String, (serde_json::Value, Option<serde_json::Value>)> =
-        existing
-            .as_ref()
-            .and_then(|nb| nb.get("cells"))
-            .and_then(|c| c.as_array())
-            .map(|cells_arr| {
-                cells_arr
-                    .iter()
-                    .filter_map(|cell| {
-                        let id = cell.get("id").and_then(|v| v.as_str())?;
-                        let meta = cell
-                            .get("metadata")
-                            .cloned()
-                            .unwrap_or(serde_json::json!({}));
-                        let attachments = cell.get("attachments").cloned();
-                        Some((id.to_string(), (meta, attachments)))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+    // Build attachments index from existing notebook (metadata comes from Automerge)
+    let existing_attachments: HashMap<String, serde_json::Value> = existing
+        .as_ref()
+        .and_then(|nb| nb.get("cells"))
+        .and_then(|c| c.as_array())
+        .map(|cells_arr| {
+            cells_arr
+                .iter()
+                .filter_map(|cell| {
+                    let id = cell.get("id").and_then(|v| v.as_str())?;
+                    let attachments = cell.get("attachments").cloned()?;
+                    Some((id.to_string(), attachments))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
 
     // Generate fresh env_id for the cloned notebook
     let new_env_id = uuid::Uuid::new_v4().to_string();
@@ -2851,11 +2825,8 @@ async fn clone_notebook_to_disk(room: &NotebookRoom, target_path: &str) -> Resul
                 .collect()
         };
 
-        // Preserve cell metadata and attachments from existing notebook
-        let (cell_meta, attachments) = existing_cell_data
-            .get(&cell.id)
-            .cloned()
-            .unwrap_or((serde_json::json!({}), None));
+        // Use metadata from the Automerge doc (populated during notebook load)
+        let cell_meta = cell.metadata.clone();
 
         let mut cell_json = serde_json::json!({
             "id": cell.id,
@@ -2869,9 +2840,9 @@ async fn clone_notebook_to_disk(room: &NotebookRoom, target_path: &str) -> Resul
             cell_json["outputs"] = serde_json::json!([]);
             cell_json["execution_count"] = serde_json::Value::Null;
         } else if cell.cell_type == "markdown" {
-            // Preserve attachments for markdown cells (embedded images)
-            if let Some(att) = attachments {
-                cell_json["attachments"] = att;
+            // Preserve attachments for markdown cells (embedded images, not synced via Automerge)
+            if let Some(att) = existing_attachments.get(&cell.id) {
+                cell_json["attachments"] = att.clone();
             }
         }
 
@@ -3184,12 +3155,19 @@ fn parse_cells_from_ipynb(json: &serde_json::Value) -> Option<Vec<CellSnapshot>>
                 })
                 .unwrap_or_default();
 
+            // Cell metadata (preserves all fields, normalize to object)
+            let metadata = match cell.get("metadata") {
+                Some(v) if v.is_object() => v.clone(),
+                _ => serde_json::json!({}),
+            };
+
             CellSnapshot {
                 id,
                 cell_type,
                 source,
                 execution_count,
                 outputs,
+                metadata,
             }
         })
         .collect();
@@ -3267,6 +3245,7 @@ struct StreamingCell {
     source: String,
     execution_count: String,
     outputs: Vec<serde_json::Value>,
+    metadata: serde_json::Value,
 }
 
 /// Convert a `jiter::JsonValue` to a `serde_json::Value`.
@@ -3381,12 +3360,19 @@ fn parse_notebook_jiter(
             _ => vec![],
         };
 
+        // Extract cell metadata (preserves all fields, normalize to object)
+        let metadata = match jobj_get(cell_obj, "metadata").map(jiter_to_serde) {
+            Some(v) if v.is_object() => v,
+            _ => serde_json::json!({}),
+        };
+
         cells.push(StreamingCell {
             id,
             cell_type,
             source,
             execution_count,
             outputs,
+            metadata,
         });
     }
 
@@ -3516,6 +3502,7 @@ where
                     &cell.source,
                     output_refs,
                     &cell.execution_count,
+                    &cell.metadata,
                 )
                 .map_err(|e| format!("Failed to add cell {}: {}", cell.id, e))?;
             }
@@ -4845,6 +4832,7 @@ mod tests {
             source: String::new(),
             execution_count: "42".to_string(),
             outputs: vec![],
+            metadata: serde_json::json!({}),
         }];
 
         let changed = apply_ipynb_changes(&room, &external_cells, false).await;
@@ -4878,6 +4866,7 @@ mod tests {
             source: "new source".to_string(),
             execution_count: "5".to_string(),
             outputs: vec![r#"{"output_type":"error"}"#.to_string()],
+            metadata: serde_json::json!({}),
         }];
 
         let changed = apply_ipynb_changes(&room, &external_cells, true).await;
@@ -4915,6 +4904,7 @@ mod tests {
                 source: String::new(),
                 execution_count: "null".to_string(),
                 outputs: vec![],
+                metadata: serde_json::json!({}),
             },
             CellSnapshot {
                 id: "new-cell".to_string(),
@@ -4922,6 +4912,7 @@ mod tests {
                 source: "print('new')".to_string(),
                 execution_count: "42".to_string(),
                 outputs: vec![r#"{"output_type":"execute_result"}"#.to_string()],
+                metadata: serde_json::json!({}),
             },
         ];
 
@@ -5418,6 +5409,7 @@ mod tests {
                     &cell.source,
                     output_refs,
                     &cell.execution_count,
+                    &cell.metadata,
                 )
                 .unwrap();
             }
