@@ -146,6 +146,11 @@ enum SyncCommand {
         message: Vec<u8>,
         reply: oneshot::Sender<Result<(), NotebookSyncError>>,
     },
+    /// Confirm that the daemon has merged all our local changes by checking
+    /// that `peer_state.shared_heads` includes our local heads.
+    ConfirmSync {
+        reply: oneshot::Sender<Result<(), NotebookSyncError>>,
+    },
 }
 
 /// Handle for sending commands to the notebook sync task.
@@ -458,6 +463,30 @@ impl NotebookSyncHandle {
                 value_json,
                 reply: reply_tx,
             })
+            .await
+            .map_err(|_| NotebookSyncError::ChannelClosed)?;
+        reply_rx
+            .await
+            .map_err(|_| NotebookSyncError::ChannelClosed)?
+    }
+
+    /// Best-effort confirmation that the daemon has merged our local changes.
+    ///
+    /// Intended for full-peer programmatic clients (`runtimed-py`) where
+    /// `create_cell` → `execute_cell` can fire in microseconds. Not needed
+    /// for the Tauri pipe path — the WASM frontend owns its doc locally,
+    /// and human interaction provides natural sync latency.
+    ///
+    /// Attempts up to 5 sync rounds, checking `peer_state.shared_heads`
+    /// after each. If confirmation does not arrive, degrades gracefully
+    /// and returns `Ok(())` because failing execution is worse than the
+    /// residual race — after 5 rounds the changes are almost certainly
+    /// applied, the heads just haven't fully converged (e.g. concurrent
+    /// edits from another peer).
+    pub async fn confirm_sync(&self) -> Result<(), NotebookSyncError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(SyncCommand::ConfirmSync { reply: reply_tx })
             .await
             .map_err(|_| NotebookSyncError::ChannelClosed)?;
         reply_rx
@@ -2098,6 +2127,58 @@ where
         Ok(())
     }
 
+    /// Best-effort confirmation that the daemon has merged our local
+    /// changes, by checking `peer_state.shared_heads` after sync.
+    ///
+    /// **Scope:** Full-peer clients (`runtimed-py`) only. The Tauri pipe
+    /// relay keeps an empty local doc and forwards raw bytes — it has no
+    /// meaningful heads to confirm. The WASM frontend doesn't need this
+    /// because human interaction provides natural sync latency.
+    ///
+    /// **Contract:** Attempts confirmation for a bounded number of rounds
+    /// (currently 5). If confirmation does not arrive, degrades gracefully
+    /// and returns `Ok(())`. Failing execution is worse than the residual
+    /// race — after multiple sync round-trips the changes are almost
+    /// certainly applied, the heads just haven't converged yet (e.g.
+    /// concurrent edits from another peer, or slow daemon under load).
+    ///
+    /// **Why it exists:** In the document-first architecture, the daemon
+    /// reads cell source from its own Automerge doc when executing. If
+    /// `create_cell` → `execute_cell` fires faster than the sync
+    /// round-trip, the daemon won't find the cell. This method closes
+    /// that gap for programmatic callers.
+    async fn sync_to_daemon_confirmed(&mut self) -> Result<(), NotebookSyncError> {
+        // Do the initial sync round
+        self.sync_to_daemon().await?;
+
+        let our_heads = self.doc.get_heads();
+        if our_heads.is_empty() {
+            return Ok(()); // Empty doc, nothing to confirm
+        }
+
+        // The sync protocol may need multiple rounds. Bound the retries
+        // so we don't loop forever if something is wrong.
+        for _ in 0..5 {
+            let shared = &self.peer_state.shared_heads;
+            if our_heads.iter().all(|h| shared.contains(h)) {
+                return Ok(()); // Daemon has confirmed all our changes
+            }
+            // Not yet confirmed — do another sync round
+            self.sync_to_daemon().await?;
+        }
+
+        // Best-effort: even if not fully confirmed after retries, the
+        // changes are very likely applied. Log and continue rather than
+        // failing the mutation — a hard error here would be worse than
+        // the original race.
+        log::debug!(
+            "[notebook-sync-client] sync_to_daemon_confirmed: heads not fully confirmed after retries (our_heads={}, shared_heads={})",
+            our_heads.len(),
+            self.peer_state.shared_heads.len()
+        );
+        Ok(())
+    }
+
     // ── Request/Response ───────────────────────────────────────────────
 
     /// Send a request to the daemon and wait for the response.
@@ -2679,6 +2760,10 @@ async fn run_sync_task<S>(
                         // so readers see daemon-driven mutations (outputs, execution
                         // counts, etc.) immediately.
                         publish_snapshot(&client, &snapshot_tx);
+                        let _ = reply.send(result);
+                    }
+                    SyncCommand::ConfirmSync { reply } => {
+                        let result = client.sync_to_daemon_confirmed().await;
                         let _ = reply.send(result);
                     }
                     SyncCommand::ReceiveFrontendSyncMessage { message, reply } => {

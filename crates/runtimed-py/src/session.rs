@@ -964,6 +964,11 @@ impl Session {
             let blob_base_url = state.blob_base_url.clone();
             let blob_store_path = state.blob_store_path.clone();
 
+            // Confirm the daemon has merged our latest changes before executing.
+            // The daemon reads cell source from its own Automerge doc, so it must
+            // have the cell before we can reference it by ID.
+            handle.confirm_sync().await.map_err(to_py_err)?;
+
             // Execute cell (daemon reads source from automerge doc)
             let response = handle
                 .send_request(NotebookRequest::ExecuteCell {
@@ -1045,6 +1050,9 @@ impl Session {
                 .handle
                 .as_ref()
                 .ok_or_else(|| to_py_err("Not connected"))?;
+
+            // Confirm the daemon has merged our latest changes before executing.
+            handle.confirm_sync().await.map_err(to_py_err)?;
 
             // Queue the cell for execution
             let response = handle
@@ -1179,6 +1187,9 @@ impl Session {
                 .handle
                 .as_ref()
                 .ok_or_else(|| to_py_err("Not connected"))?;
+
+            // Confirm the daemon has merged our latest changes before executing.
+            handle.confirm_sync().await.map_err(to_py_err)?;
 
             // Queue cell execution (daemon reads source from automerge doc)
             let response = handle
