@@ -2,6 +2,44 @@
 
 This document describes the wire protocol between notebook clients (frontend WASM + Tauri relay) and the runtimed daemon.
 
+## Compatibility
+
+Two independent version numbers handle compatibility, separate from the artifact version:
+
+- **Protocol version** (`PROTOCOL_VERSION` in `connection.rs`, currently `2`) — governs wire compatibility. Validated by the 5-byte magic preamble (`0xC0DE01AC` + version byte) at the start of every connection. Bump when the framing, handshake shape, or message serialization format changes.
+- **Schema version** (`SCHEMA_VERSION` in `notebook-doc/src/lib.rs`, currently `1`) — governs Automerge document compatibility. Stored in the doc root as `schema_version`. Bump when the document structure changes (e.g., switching cells from ordered list to fractional-indexed map).
+
+These are just incrementing integers. They evolve independently from each other and from the artifact version. A protocol or schema bump doesn't automatically force a major version bump — that depends on whether the change is user-facing.
+
+Artifact versions follow standard semver based on what users see.
+
+### Release channels
+
+**Stable:** Pushing a `v*` tag publishes Python wheels to PyPI at the version in `pyproject.toml`. No separate `python-v*` tag needed — the desktop release ships the Python package too.
+
+**Nightly:** Daily builds publish PEP 440 alpha pre-releases (e.g., `2.0.1a202603100900`). Install with `pip install runtimed --pre`.
+
+**Python-only:** The `python-v*` tag path (`python-package.yml`) exists for Python-specific patches that don't need a full desktop release.
+
+See `contributing/releasing.md` for the full release procedures.
+
+### Connection preamble
+
+Every connection starts with a 5-byte preamble before the JSON handshake frame:
+
+| Bytes | Content |
+|-------|---------|
+| 0–3 | Magic: `0xC0 0xDE 0x01 0xAC` |
+| 4 | Protocol version (currently `2`) |
+
+The daemon validates both before reading the handshake. Non-runtimed connections get a clear "invalid magic bytes" error. Protocol mismatches are rejected before any JSON parsing.
+
+After the preamble, the notebook sync path also returns `protocol_version` and `daemon_version` in its `ProtocolCapabilities` / `NotebookConnectionInfo` responses for informational purposes.
+
+### Desktop app compatibility
+
+The desktop app bundles its own daemon binary. Version-mismatch detection between the app and its bundled daemon compares git commit hashes (appended as `+{sha}` at build time), not semver. This is because both are always built from the same commit in CI.
+
 ## Overview
 
 The notebook app communicates with runtimed over a Unix socket (named pipe on Windows) using length-prefixed, typed frames. The protocol carries three kinds of traffic:
@@ -60,7 +98,7 @@ The daemon responds with a `NotebookConnectionInfo`:
 {
   "protocol": "v2",
   "protocol_version": 2,
-  "daemon_version": "0.1.0-dev.10+abc123",
+  "daemon_version": "2.0.0+abc123",
   "notebook_id": "derived-id",
   "cell_count": 5,
   "needs_trust_approval": false,

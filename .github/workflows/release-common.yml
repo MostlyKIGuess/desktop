@@ -681,7 +681,7 @@ jobs:
           cp target/${{ matrix.platform.target }}/release/runtimed.exe python/runtimed/src/runtimed/_bin/
 
       - name: Set dev version (Unix)
-        if: runner.os != 'Windows'
+        if: runner.os != 'Windows' && inputs.github_release_prerelease
         run: |
           CURRENT_VERSION=$(grep '^version' python/runtimed/pyproject.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
           # Bump patch and use alpha tag so it sorts after current stable (PEP 440)
@@ -694,7 +694,7 @@ jobs:
           sed -i.bak "s/^version = .*/version = \"${DEV_VERSION}\"/" python/runtimed/pyproject.toml
 
       - name: Set dev version (Windows)
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && inputs.github_release_prerelease
         shell: pwsh
         run: |
           $content = Get-Content python/runtimed/pyproject.toml -Raw

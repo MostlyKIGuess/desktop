@@ -1,12 +1,18 @@
 //! Unified connection framing and handshake for the runtimed socket.
 //!
-//! All connections to the daemon use length-prefixed binary framing:
+//! Every connection begins with a 5-byte preamble:
+//!
+//! ```text
+//! [4 bytes: magic 0xC0DE01AC] [1 byte: protocol version]
+//! ```
+//!
+//! Followed by length-prefixed binary framing:
 //!
 //! ```text
 //! [4 bytes: payload length (big-endian u32)] [payload bytes]
 //! ```
 //!
-//! The first frame on every connection is a JSON handshake declaring the
+//! The first frame after the preamble is a JSON handshake declaring the
 //! channel. After the handshake, the daemon routes the connection to the
 //! appropriate handler.
 //!
@@ -101,6 +107,68 @@ pub const PROTOCOL_V2: &str = "v2";
 /// Numeric protocol version for version negotiation.
 /// Increment this when making breaking protocol changes.
 pub const PROTOCOL_VERSION: u32 = 2;
+
+/// Magic bytes identifying the runtimed protocol.
+/// Sent as the first 4 bytes of every connection, before the handshake frame.
+pub const MAGIC: [u8; 4] = [0xC0, 0xDE, 0x01, 0xAC];
+
+/// Total preamble size: 4-byte magic + 1-byte protocol version.
+pub const PREAMBLE_LEN: usize = 5;
+
+/// Send the connection preamble (magic bytes + protocol version).
+///
+/// Must be called once at the start of every connection, before
+/// the handshake frame.
+pub async fn send_preamble<W: AsyncWrite + Unpin>(writer: &mut W) -> std::io::Result<()> {
+    let mut buf = [0u8; PREAMBLE_LEN];
+    buf[..4].copy_from_slice(&MAGIC);
+    buf[4] = PROTOCOL_VERSION as u8;
+    writer.write_all(&buf).await?;
+    writer.flush().await?;
+    Ok(())
+}
+
+/// Receive and validate the connection preamble.
+///
+/// Returns the protocol version byte. Returns an error if the magic bytes
+/// don't match or the protocol version is incompatible.
+pub async fn recv_preamble<R: AsyncRead + Unpin>(reader: &mut R) -> std::io::Result<u8> {
+    let mut buf = [0u8; PREAMBLE_LEN];
+    match reader.read_exact(&mut buf).await {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "connection closed before preamble",
+            ));
+        }
+        Err(e) => return Err(e),
+    }
+
+    if buf[..4] != MAGIC {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "invalid magic bytes: expected {:02X?}, got {:02X?}",
+                MAGIC,
+                &buf[..4]
+            ),
+        ));
+    }
+
+    let version = buf[4];
+    if version != PROTOCOL_VERSION as u8 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "protocol version mismatch: expected {}, got {}",
+                PROTOCOL_VERSION, version
+            ),
+        ));
+    }
+
+    Ok(version)
+}
 
 /// Server response indicating protocol capabilities.
 ///
@@ -396,6 +464,51 @@ mod tests {
         let mut cursor = std::io::Cursor::new(buf);
         let received: Handshake = recv_json_frame(&mut cursor).await.unwrap().unwrap();
         assert!(matches!(received, Handshake::Pool));
+    }
+
+    #[tokio::test]
+    async fn test_preamble_roundtrip() {
+        let mut buf = Vec::new();
+        send_preamble(&mut buf).await.unwrap();
+        assert_eq!(buf.len(), PREAMBLE_LEN);
+        assert_eq!(&buf[..4], &MAGIC);
+        assert_eq!(buf[4], PROTOCOL_VERSION as u8);
+
+        let mut cursor = std::io::Cursor::new(buf);
+        let version = recv_preamble(&mut cursor).await.unwrap();
+        assert_eq!(version, PROTOCOL_VERSION as u8);
+    }
+
+    #[tokio::test]
+    async fn test_preamble_bad_magic() {
+        let buf = [0xFF, 0xFF, 0xFF, 0xFF, PROTOCOL_VERSION as u8];
+        let mut cursor = std::io::Cursor::new(buf.to_vec());
+        let result = recv_preamble(&mut cursor).await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn test_preamble_version_mismatch() {
+        let mut buf = [0u8; PREAMBLE_LEN];
+        buf[..4].copy_from_slice(&MAGIC);
+        buf[4] = 99; // wrong version
+        let mut cursor = std::io::Cursor::new(buf.to_vec());
+        let result = recv_preamble(&mut cursor).await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn test_preamble_eof() {
+        let buf: &[u8] = &[0xC0, 0xDE]; // incomplete
+        let mut cursor = std::io::Cursor::new(buf);
+        let result = recv_preamble(&mut cursor).await;
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
     }
 
     #[tokio::test]
