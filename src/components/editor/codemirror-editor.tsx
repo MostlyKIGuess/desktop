@@ -219,31 +219,31 @@ export const CodeMirrorEditor = forwardRef<
       autoFocus,
     });
 
-    // Store the editor view reference
+    // Store the editor view reference (kept for backwards compat with getEditor)
     useEffect(() => {
       editorViewRef.current = view || null;
     }, [view]);
 
-    // Expose methods via ref
+    // Expose methods via ref - depends on `view` so handle updates when view is ready
     useImperativeHandle(
       ref,
       () => ({
         focus: () => {
-          editorViewRef.current?.focus();
+          view?.focus();
         },
         setCursorPosition: (position: "start" | "end") => {
-          if (editorViewRef.current) {
-            const doc = editorViewRef.current.state.doc;
+          if (view) {
+            const doc = view.state.doc;
             const pos = position === "start" ? 0 : doc.length;
-            editorViewRef.current.dispatch({
+            view.dispatch({
               selection: { anchor: pos, head: pos },
               scrollIntoView: true,
             });
           }
         },
-        getEditor: () => editorViewRef.current,
+        getEditor: () => view || null,
       }),
-      [],
+      [view],
     );
 
     useEffect(() => {

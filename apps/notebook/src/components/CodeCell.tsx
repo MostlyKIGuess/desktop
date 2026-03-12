@@ -22,7 +22,6 @@ import { AnsiOutput } from "@/components/outputs/ansi-output";
 import { ErrorBoundary } from "@/lib/error-boundary";
 import type { CellPagePayload, MimeBundle } from "../App";
 import { useCellKeyboardNavigation } from "../hooks/useCellKeyboardNavigation";
-import { useEditorRegistry } from "../hooks/useEditorRegistry";
 import { kernelCompletionExtension } from "../lib/kernel-completion";
 import { openUrl } from "../lib/open-url";
 import { tabCompletionKeymap } from "../lib/tab-completion";
@@ -97,6 +96,10 @@ interface CodeCellProps {
   isLastCell?: boolean;
   /** Whether this cell is immediately before the focused cell */
   isPreviousCellFromFocused?: boolean;
+  /** Props for dnd-kit drag handle (applied to ribbon) */
+  dragHandleProps?: Record<string, unknown>;
+  /** Whether this cell is currently being dragged */
+  isDragging?: boolean;
 }
 
 export function CodeCell({
@@ -119,22 +122,11 @@ export function CodeCell({
   onClearPagePayload,
   isLastCell = false,
   isPreviousCellFromFocused,
+  dragHandleProps,
+  isDragging,
 }: CodeCellProps) {
   const editorRef = useRef<CodeMirrorEditorRef>(null);
-  const { registerEditor, unregisterEditor } = useEditorRegistry();
   const [historyDialogOpen, setHistoryDialogOpen] = useState(false);
-
-  // Register editor with the registry for cross-cell navigation
-  useEffect(() => {
-    if (editorRef.current) {
-      registerEditor(cell.id, {
-        focus: () => editorRef.current?.focus(),
-        setCursorPosition: (position) =>
-          editorRef.current?.setCursorPosition(position),
-      });
-    }
-    return () => unregisterEditor(cell.id);
-  }, [cell.id, registerEditor, unregisterEditor]);
 
   // Handle Escape key to dismiss page payload
   useEffect(() => {
@@ -181,6 +173,7 @@ export function CodeCell({
         }
       : undefined,
     onDelete,
+    cellId: cell.id,
   });
 
   // Ctrl+R to open history search
@@ -254,6 +247,8 @@ export function CodeCell({
         onFocus={onFocus}
         gutterContent={gutterContent}
         rightGutterContent={rightGutterContent}
+        dragHandleProps={dragHandleProps}
+        isDragging={isDragging}
         codeContent={
           <>
             {/* Editor */}

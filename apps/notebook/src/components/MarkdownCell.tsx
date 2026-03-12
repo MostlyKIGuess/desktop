@@ -11,7 +11,6 @@ import { IsolatedFrame, type IsolatedFrameHandle } from "@/components/isolated";
 import { isDarkMode as detectDarkMode } from "@/lib/dark-mode";
 import { cn } from "@/lib/utils";
 import { useCellKeyboardNavigation } from "../hooks/useCellKeyboardNavigation";
-import { useEditorRegistry } from "../hooks/useEditorRegistry";
 import { useBlobPort } from "../hooks/useManifestResolver";
 import { logger } from "../lib/logger";
 import { rewriteMarkdownAssetRefs } from "../lib/markdown-assets";
@@ -31,6 +30,10 @@ interface MarkdownCellProps {
   isLastCell?: boolean;
   /** Whether this cell is immediately before the focused cell */
   isPreviousCellFromFocused?: boolean;
+  /** Props for dnd-kit drag handle (applied to ribbon) */
+  dragHandleProps?: Record<string, unknown>;
+  /** Whether this cell is currently being dragged */
+  isDragging?: boolean;
 }
 
 export function MarkdownCell({
@@ -45,6 +48,8 @@ export function MarkdownCell({
   onInsertCellAfter,
   isLastCell = false,
   isPreviousCellFromFocused,
+  dragHandleProps,
+  isDragging,
 }: MarkdownCellProps) {
   const applyInlineFormatting = useCallback(
     (prefix: string, suffix = prefix) =>
@@ -126,7 +131,6 @@ export function MarkdownCell({
   const editorRef = useRef<CodeMirrorEditorRef>(null);
   const frameRef = useRef<IsolatedFrameHandle>(null);
   const viewRef = useRef<HTMLDivElement>(null);
-  const { registerEditor, unregisterEditor } = useEditorRegistry();
 
   // Track dark mode state for iframe theme sync
   const [darkMode, setDarkMode] = useState(() => detectDarkMode());
@@ -143,18 +147,6 @@ export function MarkdownCell({
   }, []);
 
   const blobPort = useBlobPort();
-
-  // Register editor with the registry for cross-cell navigation
-  useEffect(() => {
-    if (editing && editorRef.current) {
-      registerEditor(cell.id, {
-        focus: () => editorRef.current?.focus(),
-        setCursorPosition: (position) =>
-          editorRef.current?.setCursorPosition(position),
-      });
-    }
-    return () => unregisterEditor(cell.id);
-  }, [cell.id, editing, registerEditor, unregisterEditor]);
 
   const handleDoubleClick = useCallback(() => {
     setEditing(true);
@@ -254,6 +246,7 @@ export function MarkdownCell({
     onFocusNext: handleFocusNextOrCreate,
     onExecute: () => {}, // No-op for markdown, enables Shift+Enter navigation
     onDelete,
+    cellId: cell.id,
   });
 
   // Combine navigation with markdown-specific keys
@@ -340,6 +333,8 @@ export function MarkdownCell({
       isFocused={isFocused}
       isPreviousCellFromFocused={isPreviousCellFromFocused}
       onFocus={onFocus}
+      dragHandleProps={dragHandleProps}
+      isDragging={isDragging}
     >
       {/* Editor section - hidden when not editing */}
       <div className={editing ? "block" : "hidden"}>
