@@ -91,6 +91,14 @@ export interface IsolatedFrameProps {
    * Callback for all messages from the iframe (for debugging or custom handling).
    */
   onMessage?: (message: IframeToParentMessage) => void;
+
+  /**
+   * When true, iframe starts hidden (0 height, 0 opacity) and reveals
+   * with animation after content is rendered. Use for markdown cells
+   * to prevent flash of empty/unstyled content during bootstrap.
+   * @default false
+   */
+  revealOnRender?: boolean;
 }
 
 export interface IsolatedFrameHandle {
@@ -210,6 +218,7 @@ export const IsolatedFrame = forwardRef<
     onWidgetUpdate,
     onError,
     onMessage,
+    revealOnRender = false,
   },
   ref,
 ) {
@@ -229,6 +238,8 @@ export const IsolatedFrame = forwardRef<
   // Use ref to track ready state for send callback (avoids stale closure)
   const isReadyRef = useRef(false);
   const [height, setHeight] = useState(minHeight);
+  // Track if content has been rendered (for revealOnRender mode)
+  const [isContentRendered, setIsContentRendered] = useState(false);
 
   // Queue messages until iframe is ready
   const pendingMessagesRef = useRef<ParentToIframeMessage[]>([]);
@@ -248,15 +259,16 @@ export const IsolatedFrame = forwardRef<
     };
   }, []);
 
-  // Forward theme changes to iframe (without recreating the blob)
+  // Send theme as soon as iframe is ready (before renderer bootstrap)
+  // This prevents flash of wrong theme while React initializes
   useEffect(() => {
-    if (isReady && iframeRef.current?.contentWindow) {
+    if (isIframeReady && iframeRef.current?.contentWindow) {
       iframeRef.current.contentWindow.postMessage(
         { type: "theme", payload: { isDark: darkMode } },
         "*",
       );
     }
-  }, [darkMode, isReady]);
+  }, [darkMode, isIframeReady]);
 
   // Keep ref in sync with state (ref avoids stale closures in callbacks)
   useEffect(() => {
@@ -340,6 +352,8 @@ export const IsolatedFrame = forwardRef<
             // them so they don't get delivered to the reloaded frame.
             pendingMessagesRef.current.length = 0;
             setIsReady(false);
+            // Reset content rendered state for revealOnRender mode
+            setIsContentRendered(false);
           }
 
           // Renderer injection is handled by a separate useEffect that depends
@@ -380,6 +394,18 @@ export const IsolatedFrame = forwardRef<
 
         case "resize":
           if (data.payload?.height != null) {
+            const newHeight = autoHeight
+              ? Math.max(minHeight, data.payload.height)
+              : Math.max(minHeight, Math.min(maxHeight, data.payload.height));
+            setHeight(newHeight);
+            onResize?.(newHeight);
+          }
+          break;
+
+        case "render_complete":
+          // Content has been rendered - reveal iframe if in revealOnRender mode
+          if (data.payload?.height != null) {
+            setIsContentRendered(true);
             const newHeight = autoHeight
               ? Math.max(minHeight, data.payload.height)
               : Math.max(minHeight, Math.min(maxHeight, data.payload.height));
@@ -519,6 +545,10 @@ export const IsolatedFrame = forwardRef<
     return null;
   }
 
+  // Compute display values for revealOnRender mode
+  const displayHeight = revealOnRender && !isContentRendered ? 0 : height;
+  const displayOpacity = revealOnRender && !isContentRendered ? 0 : 1;
+
   return (
     <iframe
       ref={iframeRef}
@@ -529,9 +559,15 @@ export const IsolatedFrame = forwardRef<
       data-slot="isolated-frame"
       style={{
         width: "100%",
-        height: `${height}px`,
+        height: `${displayHeight}px`,
+        opacity: displayOpacity,
         border: "none",
         display: "block",
+        background: "transparent",
+        colorScheme: darkMode ? "dark" : "light",
+        transition: revealOnRender
+          ? "height 150ms ease-out, opacity 150ms ease-out"
+          : undefined,
       }}
       title="Isolated output frame"
     />
