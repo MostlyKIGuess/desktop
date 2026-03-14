@@ -4,9 +4,10 @@
 
 | Task | Command |
 |------|---------|
-| Start dev server | `cargo xtask dev` |
+| One-shot notebook setup | `cargo xtask dev` |
+| Start dev server | `cargo xtask notebook` |
 | Standalone Vite | `cargo xtask vite` |
-| Attach to Vite | `cargo xtask dev --attach` |
+| Attach to Vite | `cargo xtask notebook --attach` |
 | Full debug build | `cargo xtask build` |
 | Rust-only rebuild | `cargo xtask build --rust-only` |
 | Run bundled binary | `cargo xtask run` |
@@ -18,15 +19,37 @@
 
 ## Choosing a Workflow
 
-### `cargo xtask dev` — Hot Reload
+### `cargo xtask dev` — One Command Setup + Dev
 
-Best for UI/React development. Uses Vite dev server on port 5174. Changes to React components hot-reload instantly.
+Best for first-time local setup or when you want the daemon and notebook app to
+come up together.
 
 ```bash
 cargo xtask dev
 ```
 
-### `cargo xtask vite` + `dev --attach` — Multi-Window Testing
+This command:
+- runs `pnpm install` when your workspace dependencies are missing or stale
+- runs `cargo xtask build` unless you pass `--skip-build`
+- starts the per-worktree dev daemon
+- waits for the daemon to be reachable
+- launches the notebook app in dev mode
+
+For faster repeat launches:
+
+```bash
+cargo xtask dev --skip-install --skip-build
+```
+
+### `cargo xtask notebook` — Hot Reload
+
+Best for UI/React development. Uses Vite dev server on port 5174. Changes to React components hot-reload instantly.
+
+```bash
+cargo xtask notebook
+```
+
+### `cargo xtask vite` + `notebook --attach` — Multi-Window Testing
 
 When testing with multiple notebook windows, closing the first Tauri window normally kills the Vite server. To avoid this:
 
@@ -35,7 +58,7 @@ When testing with multiple notebook windows, closing the first Tauri window norm
 cargo xtask vite
 
 # Terminal 2+: Attach Tauri to existing Vite
-cargo xtask dev --attach
+cargo xtask notebook --attach
 ```
 
 Now you can close and reopen Tauri windows without losing Vite. This is useful for:
@@ -129,7 +152,9 @@ In production, the Tauri app auto-installs and manages the system daemon. In dev
 cargo xtask dev-daemon
 
 # Terminal 2: Run the notebook app
-cargo xtask dev              # Hot-reload mode
+cargo xtask notebook         # Hot-reload mode
+# or
+cargo xtask dev              # One-shot setup + daemon + app
 # or
 cargo xtask build            # Full build once
 cargo xtask build --rust-only && cargo xtask run  # Fast iteration
@@ -137,7 +162,7 @@ cargo xtask build --rust-only && cargo xtask run  # Fast iteration
 
 The app detects dev mode and connects to the per-worktree daemon instead of installing/starting the system daemon.
 
-**Conductor users:** When using `cargo xtask dev` or `cargo xtask dev-daemon`, the xtask commands automatically translate `CONDUCTOR_WORKSPACE_PATH` to `RUNTIMED_WORKSPACE_PATH`, enabling dev mode.
+**Conductor users:** When using `cargo xtask dev`, `cargo xtask notebook`, or `cargo xtask dev-daemon`, the xtask commands automatically translate `CONDUCTOR_WORKSPACE_PATH` to `RUNTIMED_WORKSPACE_PATH`, enabling dev mode.
 
 **Non-Conductor users:** Set `RUNTIMED_DEV=1`:
 
@@ -146,7 +171,7 @@ The app detects dev mode and connects to the per-worktree daemon instead of inst
 RUNTIMED_DEV=1 cargo xtask dev-daemon
 
 # Terminal 2
-RUNTIMED_DEV=1 cargo xtask dev
+RUNTIMED_DEV=1 cargo xtask notebook
 ```
 
 **Useful commands:**
@@ -180,7 +205,7 @@ unset RUNTIMED_WORKSPACE_PATH
 cargo xtask install-daemon
 
 # Run the app (it will connect to system daemon)
-cargo xtask dev
+cargo xtask notebook
 ```
 
 ### Daemon logs
@@ -234,7 +259,7 @@ The repo includes `.zed/tasks.json` with pre-configured tasks that set the corre
 | Task | What it does |
 |------|-------------|
 | **Dev Daemon** | `cargo xtask dev-daemon` with `RUNTIMED_DEV=1` and `RUNTIMED_WORKSPACE_PATH` |
-| **Dev App** | `cargo xtask dev` with dev env vars and auto-assigned Vite port |
+| **Dev App** | `cargo xtask notebook` with dev env vars and auto-assigned Vite port |
 | **Daemon Status** | `./target/debug/runt daemon status` pointed at the worktree daemon |
 | **Daemon Logs** | `./target/debug/runt daemon logs -f` with live tail |
 | **Format** | `cargo fmt` + biome in one step |
