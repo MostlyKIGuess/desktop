@@ -85,6 +85,11 @@ pub struct SyncTaskConfig {
 
     /// Broadcast sender for kernel/execution events from the daemon.
     pub broadcast_tx: broadcast::Sender<NotebookBroadcast>,
+
+    /// Optional channel for forwarding raw daemon frames to a pipe consumer
+    /// (e.g. Tauri relay to WASM frontend). When `Some`, incoming frames are
+    /// cloned to this sender before local processing.
+    pub pipe_frame_tx: Option<mpsc::UnboundedSender<Vec<u8>>>,
 }
 
 /// Run the sync task.
@@ -189,6 +194,7 @@ where
                             &config.snapshot_tx,
                             &config.broadcast_tx,
                             &notebook_id,
+                            &config.pipe_frame_tx,
                         )
                         .await;
                     }
@@ -232,6 +238,7 @@ where
                             req_broadcast_tx.as_ref(),
                             &request,
                             &notebook_id,
+                            &config.pipe_frame_tx,
                         )
                         .await;
                         let _ = reply.send(result);
@@ -245,6 +252,7 @@ where
                             &config.snapshot_tx,
                             &config.broadcast_tx,
                             &notebook_id,
+                            &config.pipe_frame_tx,
                         )
                         .await;
                         let _ = reply.send(result);
@@ -303,6 +311,7 @@ where
                         &config.snapshot_tx,
                         &config.broadcast_tx,
                         &notebook_id,
+                        &config.pipe_frame_tx,
                     )
                     .await;
                 }
@@ -342,7 +351,24 @@ async fn handle_incoming_frame<W: AsyncWrite + Unpin>(
     snapshot_tx: &Arc<tokio::sync::watch::Sender<NotebookSnapshot>>,
     broadcast_tx: &broadcast::Sender<NotebookBroadcast>,
     notebook_id: &str,
+    pipe_frame_tx: &Option<mpsc::UnboundedSender<Vec<u8>>>,
 ) {
+    // Forward sync/broadcast/presence frames to pipe consumer before local
+    // processing. Response and Request frames are internal to the protocol
+    // and must not be piped to the WASM frontend.
+    if let Some(ref pipe_tx) = pipe_frame_tx {
+        match frame.frame_type {
+            NotebookFrameType::AutomergeSync
+            | NotebookFrameType::Broadcast
+            | NotebookFrameType::Presence => {
+                let mut bytes = vec![frame.frame_type as u8];
+                bytes.extend_from_slice(&frame.payload);
+                let _ = pipe_tx.send(bytes);
+            }
+            _ => {}
+        }
+    }
+
     match frame.frame_type {
         NotebookFrameType::AutomergeSync => {
             let msg = match sync::Message::decode(&frame.payload) {
@@ -440,6 +466,7 @@ async fn send_request_impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     req_broadcast_tx: Option<&broadcast::Sender<NotebookBroadcast>>,
     request: &NotebookRequest,
     notebook_id: &str,
+    pipe_frame_tx: &Option<mpsc::UnboundedSender<Vec<u8>>>,
 ) -> Result<NotebookResponse, SyncError> {
     // Serialize and send the request
     let payload =
@@ -466,6 +493,7 @@ async fn send_request_impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
             broadcast_tx,
             req_broadcast_tx,
             notebook_id,
+            pipe_frame_tx,
         ),
     )
     .await;
@@ -478,6 +506,7 @@ async fn send_request_impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 }
 
 /// Wait for a Response frame from the daemon, processing other frames.
+#[allow(clippy::too_many_arguments)]
 async fn wait_for_response<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     doc: &Arc<Mutex<SharedDocState>>,
     reader: &mut R,
@@ -486,12 +515,30 @@ async fn wait_for_response<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     broadcast_tx: &broadcast::Sender<NotebookBroadcast>,
     req_broadcast_tx: Option<&broadcast::Sender<NotebookBroadcast>>,
     notebook_id: &str,
+    pipe_frame_tx: &Option<mpsc::UnboundedSender<Vec<u8>>>,
 ) -> Result<NotebookResponse, SyncError> {
     loop {
         let frame = connection::recv_typed_frame(reader)
             .await
             .map_err(SyncError::Io)?
             .ok_or_else(|| SyncError::Protocol("Connection closed waiting for response".into()))?;
+
+        // Forward sync/broadcast/presence frames to pipe consumer while
+        // waiting for a response. Without this, daemon frames received
+        // during a request/response cycle would be consumed locally but
+        // never reach the WASM frontend, causing it to desync.
+        if let Some(ref pipe_tx) = pipe_frame_tx {
+            match frame.frame_type {
+                NotebookFrameType::AutomergeSync
+                | NotebookFrameType::Broadcast
+                | NotebookFrameType::Presence => {
+                    let mut bytes = vec![frame.frame_type as u8];
+                    bytes.extend_from_slice(&frame.payload);
+                    let _ = pipe_tx.send(bytes);
+                }
+                _ => {}
+            }
+        }
 
         match frame.frame_type {
             NotebookFrameType::Response => {
@@ -556,6 +603,7 @@ async fn confirm_sync_impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     snapshot_tx: &Arc<tokio::sync::watch::Sender<NotebookSnapshot>>,
     broadcast_tx: &broadcast::Sender<NotebookBroadcast>,
     notebook_id: &str,
+    pipe_frame_tx: &Option<mpsc::UnboundedSender<Vec<u8>>>,
 ) -> Result<(), SyncError> {
     for round in 0..5 {
         // Generate and send sync message
@@ -591,8 +639,16 @@ async fn confirm_sync_impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         .await
         {
             Ok(Ok(Some(frame))) => {
-                handle_incoming_frame(&frame, doc, writer, snapshot_tx, broadcast_tx, notebook_id)
-                    .await;
+                handle_incoming_frame(
+                    &frame,
+                    doc,
+                    writer,
+                    snapshot_tx,
+                    broadcast_tx,
+                    notebook_id,
+                    pipe_frame_tx,
+                )
+                .await;
             }
             Ok(Ok(None)) => {
                 return Err(SyncError::Protocol(
