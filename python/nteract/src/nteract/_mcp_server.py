@@ -255,19 +255,66 @@ def _outputs_to_content(outputs: list[runtimed.Output]) -> list[ContentItem]:
     return items
 
 
+def _build_cell_status_map(queue_state: runtimed.QueueState) -> dict[str, str]:
+    """Build a cell_id -> status mapping from queue state."""
+    cell_status: dict[str, str] = {}
+    if queue_state.executing:
+        cell_status[queue_state.executing] = "running"
+    for cid in queue_state.queued:
+        cell_status[cid] = "queued"
+    return cell_status
+
+
+async def _get_cell_status_map(session: runtimed.AsyncSession) -> dict[str, str]:
+    """Fetch queue state and return cell status map, empty on failure.
+
+    Status is a best-effort annotation — errors should never prevent
+    get_all_cells or get_cell from returning results.
+    """
+    try:
+        queue_state = await session.get_queue_state()
+        return _build_cell_status_map(queue_state)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        return {}
+
+
+async def _get_single_cell_status(session: runtimed.AsyncSession, cell_id: str) -> str | None:
+    """Fetch queue status for a single cell, None on failure."""
+    try:
+        queue_state = await session.get_queue_state()
+        if queue_state.executing == cell_id:
+            return "running"
+        if cell_id in queue_state.queued:
+            return "queued"
+        return None
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        return None
+
+
 def _format_cell_summary(
     index: int,
     cell: runtimed.Cell,
     preview_chars: int = 60,
     include_outputs: bool = False,
+    status: str | None = None,
 ) -> str:
     """Format a cell as a single summary line.
 
     Example output:
     0 | markdown | id=cell-1be2a179-... | # Crate Download Analysis
-    1 | code | id=cell-e18fcc2a-... | exec=4 | import requests…[+45 chars]
+    1 | code | running | id=cell-e18fcc2a-... | exec=4 | import requests…[+45 chars]
+    2 | code | queued | id=cell-abc123-... | exec=3 | df.plot()…[+20 chars]
     """
-    parts = [str(index), cell.cell_type, f"id={cell.id}"]
+    parts = [str(index), cell.cell_type]
+
+    if status:
+        parts.append(status)
+
+    parts.append(f"id={cell.id}")
 
     if cell.cell_type == "code" and cell.execution_count is not None:
         parts.append(f"exec={cell.execution_count}")
@@ -307,7 +354,7 @@ def _format_header(
 
     Example: ━━━ cell-abc12345 (code) ✓ idle [3] ━━━
     """
-    icons = {"idle": "✓", "error": "✗", "running": "◐"}
+    icons = {"idle": "✓", "error": "✗", "running": "◐", "queued": "⧗"}
 
     parts = [f"━━━ {cell_id}"]
 
@@ -325,12 +372,14 @@ def _format_header(
     return " ".join(parts)
 
 
-def _format_cell(cell: runtimed.Cell) -> str:
+def _format_cell(cell: runtimed.Cell, status: str | None = None) -> str:
     """Format a cell for terminal display (includes source).
 
     Used by get_cell to show full cell state.
     """
-    header = _format_header(cell.id, cell_type=cell.cell_type, execution_count=cell.execution_count)
+    header = _format_header(
+        cell.id, cell_type=cell.cell_type, status=status, execution_count=cell.execution_count
+    )
     output_text = _format_outputs_text(cell.outputs)
 
     if cell.source and output_text:
@@ -343,12 +392,14 @@ def _format_cell(cell: runtimed.Cell) -> str:
         return header
 
 
-def _cell_to_content(cell: runtimed.Cell) -> list[ContentItem]:
+def _cell_to_content(cell: runtimed.Cell, status: str | None = None) -> list[ContentItem]:
     """Convert a cell to rich MCP content items.
 
     Returns a header as TextContent, then each output as its richest type.
     """
-    header = _format_header(cell.id, cell_type=cell.cell_type, execution_count=cell.execution_count)
+    header = _format_header(
+        cell.id, cell_type=cell.cell_type, status=status, execution_count=cell.execution_count
+    )
     items: list[ContentItem] = []
 
     if cell.source:
@@ -940,7 +991,8 @@ async def get_cell(
     session = await _get_session()
     await _send_cell_cursor(session, cell_id)
     cell = await session.get_cell(cell_id=cell_id)
-    return _cell_to_content(cell)
+    status = await _get_single_cell_status(session, cell_id)
+    return _cell_to_content(cell, status=status)
 
 
 def _output_to_dict(output: runtimed.Output) -> dict[str, Any]:
@@ -1004,6 +1056,9 @@ async def get_all_cells(
     session = await _get_session()
     cells = await session.get_cells()
 
+    # Fetch execution queue state to annotate running/queued cells
+    cell_status = await _get_cell_status_map(session)
+
     # Apply pagination
     end = start + count if count is not None else len(cells)
     cells = cells[start:end]
@@ -1016,6 +1071,7 @@ async def get_all_cells(
                 "execution_count": cell.execution_count,
                 "source": cell.source,
                 "outputs": [_output_to_dict(o) for o in cell.outputs],
+                "status": cell_status.get(cell.id),
             }
             for cell in cells
         ]
@@ -1023,12 +1079,18 @@ async def get_all_cells(
     if format == "rich":
         items: list[ContentItem] = []
         for cell in cells:
-            items.extend(_cell_to_content(cell))
+            items.extend(_cell_to_content(cell, status=cell_status.get(cell.id)))
         return items
 
     # Default summary format - compact one-line-per-cell
     lines = [
-        _format_cell_summary(start + i, cell, preview_chars, include_outputs)
+        _format_cell_summary(
+            start + i,
+            cell,
+            preview_chars,
+            include_outputs,
+            status=cell_status.get(cell.id),
+        )
         for i, cell in enumerate(cells)
     ]
     return "\n".join(lines)
@@ -1142,7 +1204,11 @@ async def resource_cells() -> str:
 
     try:
         cells = await _session.get_cells()
-        lines = [_format_cell_summary(i, cell) for i, cell in enumerate(cells)]
+        cell_status = await _get_cell_status_map(_session)
+        lines = [
+            _format_cell_summary(i, cell, status=cell_status.get(cell.id))
+            for i, cell in enumerate(cells)
+        ]
         return "\n".join(lines)
     except Exception as e:
         return f"Error: {e}"
@@ -1157,7 +1223,8 @@ async def resource_cell(cell_id: str) -> str:
     try:
         await _send_cell_cursor(_session, cell_id)
         cell = await _session.get_cell(cell_id=cell_id)
-        return _format_cell(cell)
+        status = await _get_single_cell_status(_session, cell_id)
+        return _format_cell(cell, status=status)
     except Exception as e:
         return f"Error: {e}"
 
@@ -1174,7 +1241,8 @@ async def resource_cell_by_index(index: int) -> str:
             return f"Error: Index {index} out of range (notebook has {len(cells)} cells)"
         cell = cells[index]
         await _send_cell_cursor(_session, cell.id)
-        return _format_cell(cell)
+        status = await _get_single_cell_status(_session, cell.id)
+        return _format_cell(cell, status=status)
     except Exception as e:
         return f"Error: {e}"
 
