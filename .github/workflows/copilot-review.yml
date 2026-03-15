@@ -1,22 +1,17 @@
-name: Label PRs
+name: Copilot Review
 
 on:
   pull_request:
-    types: [opened, synchronize]
+    types: [opened, ready_for_review, synchronize]
 
 permissions:
   contents: read
   pull-requests: write
 
 jobs:
-  label:
+  copilot-review:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/labeler@v6
-        with:
-          sync-labels: false
-
-      # Apply quill label for Quill Agent PRs
       - uses: actions/github-script@v8
         with:
           script: |
@@ -24,10 +19,10 @@ jobs:
             const author = context.payload.pull_request.user.login;
             if ((author === 'rgbkrk' || author === 'quillaid') &&
                 (body.includes('agent Quill') || body.includes('agent, Quill'))) {
-              await github.rest.issues.addLabels({
+              await github.rest.pulls.requestReviewers({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
-                issue_number: context.issue.number,
-                labels: ['quill']
+                pull_number: context.issue.number,
+                reviewers: ['copilot']
               });
             }
