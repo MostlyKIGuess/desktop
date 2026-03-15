@@ -178,7 +178,7 @@ with runtimed.Session() as session:
 | `kernel_started` | `bool` | Whether kernel is running |
 | `kernel_type` | `str \| None` | Current kernel type ("python", "deno", or None if not started) |
 | `env_source` | `str \| None` | Environment source (e.g., "uv:prewarmed") |
-| `connection_info` | `dict \| None` | Kernel connection info (ports, transport, key) when kernel is running |
+| `connection_info` | `NotebookConnectionInfo \| None` | Notebook connection info after connecting. Fields: `protocol` (str), `notebook_id` (str), `cell_count` (int), `needs_trust_approval` (bool), and optional `protocol_version` (int \| None), `daemon_version` (str \| None), `error` (str \| None) |
 
 ## AsyncSession API
 
@@ -389,6 +389,7 @@ for event in events:
     event.event_type      # "execution_started", "output", "done", "error"
     event.cell_id         # Cell this event is for
     event.output          # Output object (only for "output" events)
+    event.output_index    # int | None (only for "output" events: index in cell's output list)
     event.execution_count # int (only for "execution_started" events)
     event.error_message   # str (only for "error" events)
 ```
@@ -426,6 +427,8 @@ cell.cell_type       # "code", "markdown", or "raw"
 cell.position        # Fractional index string for ordering
 cell.source          # Cell source content
 cell.execution_count # Execution count if executed
+cell.outputs         # List of Output objects (resolved from automerge document)
+cell.metadata_json   # Cell metadata as JSON string
 ```
 
 ## Multi-Client Scenarios
