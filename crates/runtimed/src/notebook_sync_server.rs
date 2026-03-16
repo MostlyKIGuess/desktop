@@ -4881,12 +4881,13 @@ pub(crate) fn spawn_notebook_file_watcher(
                                 }
                             };
                             let external_attachments = parse_nbformat_attachments_from_ipynb(&json);
+                            let external_metadata = parse_metadata_from_ipynb(&json);
 
                             // Check if kernel is running (to preserve outputs)
                             let has_kernel = room.has_kernel().await;
 
-                            // Apply changes to Automerge doc
-                            let changed = apply_ipynb_changes(
+                            // Apply cell changes to Automerge doc
+                            let cells_changed = apply_ipynb_changes(
                                 &room,
                                 &external_cells,
                                 &external_attachments,
@@ -4894,26 +4895,41 @@ pub(crate) fn spawn_notebook_file_watcher(
                             )
                             .await;
 
-                            if changed {
+                            // Apply metadata changes to Automerge doc.
+                            // Only update when the external file has a metadata
+                            // object — a missing key means "no metadata info",
+                            // not "clear metadata".
+                            let metadata_changed = if let Some(ref meta) = external_metadata {
+                                let current = {
+                                    let doc = room.doc.read().await;
+                                    doc.get_metadata_snapshot()
+                                };
+                                let changed = Some(meta) != current.as_ref();
+                                if changed {
+                                    let mut doc = room.doc.write().await;
+                                    if let Err(e) = doc.set_metadata_snapshot(meta) {
+                                        warn!("[notebook-watch] Failed to set metadata: {}", e);
+                                    }
+                                }
+                                changed
+                            } else {
+                                false
+                            };
+
+                            if cells_changed || metadata_changed {
                                 info!(
-                                    "[notebook-watch] Applied external changes from {:?}",
-                                    notebook_path
+                                    "[notebook-watch] Applied external changes from {:?} (cells={}, metadata={})",
+                                    notebook_path, cells_changed, metadata_changed,
                                 );
 
-                                // Notify peers of the change
+                                // Notify peers of the change — actual data
+                                // arrives via Automerge sync frames
                                 let _ = room.changed_tx.send(());
 
-                                // Broadcast FileChanged to all connected clients
-                                let cells = {
-                                    let doc = room.doc.read().await;
-                                    doc.get_cells()
-                                };
-                                let _ = room.kernel_broadcast_tx.send(
-                                    NotebookBroadcast::FileChanged {
-                                        cells,
-                                        metadata: None, // TODO: handle metadata changes
-                                    }
-                                );
+                                // Signal that external file changes were merged
+                                let _ = room
+                                    .kernel_broadcast_tx
+                                    .send(NotebookBroadcast::FileChanged);
                             }
                         }
                         Err(errs) => {
