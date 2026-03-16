@@ -3833,10 +3833,7 @@ pub fn run(
                     let _ = app_for_autolaunch.emit("daemon:unavailable", serde_json::json!({
                         "reason": "sync_timeout",
                         "message": "Daemon sync timed out. The runtime daemon may not be running.",
-                        "guidance": format!(
-                            "Run 'cargo xtask dev-daemon' in another terminal (dev mode), or check daemon status with '{} daemon status'.",
-                            runt_workspace::cli_command_name()
-                        )
+                        "guidance": runt_workspace::daemon_unavailable_guidance()
                     }));
                 } else if daemon_sync_success_for_autolaunch.load(Ordering::SeqCst) {
                     // Daemon sync succeeded - daemon handles auto-launch
@@ -3853,10 +3850,7 @@ pub fn run(
                     let _ = app_for_autolaunch.emit("daemon:unavailable", serde_json::json!({
                         "reason": "sync_failed",
                         "message": "Failed to connect to runtime daemon.",
-                        "guidance": format!(
-                            "Run 'cargo xtask dev-daemon' in another terminal (dev mode), or check daemon status with '{} daemon status'.",
-                            runt_workspace::cli_command_name()
-                        )
+                        "guidance": runt_workspace::daemon_unavailable_guidance()
                     }));
                 }
             });
