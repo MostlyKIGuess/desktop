@@ -2117,11 +2117,22 @@ impl RoomKernel {
             use nix::sys::signal::{killpg, Signal};
             use nix::unistd::Pid;
             if let Err(e) = killpg(Pid::from_raw(pgid), Signal::SIGKILL) {
-                if e != nix::errno::Errno::ESRCH {
-                    error!(
-                        "[kernel-manager] Failed to kill process group {}: {}",
-                        pgid, e
-                    );
+                match e {
+                    // Process group already gone — nothing to do
+                    nix::errno::Errno::ESRCH => {}
+                    // Permission denied — pgid may have been reused or is no longer ours
+                    nix::errno::Errno::EPERM => {
+                        debug!(
+                            "[kernel-manager] Permission denied killing process group {}",
+                            pgid
+                        );
+                    }
+                    other => {
+                        error!(
+                            "[kernel-manager] Failed to kill process group {}: {}",
+                            pgid, other
+                        );
+                    }
                 }
             }
         }
