@@ -527,6 +527,77 @@ pub struct NotebookRoom {
     watcher_shutdown_tx: Mutex<Option<oneshot::Sender<()>>>,
 }
 
+/// Maximum number of snapshots to keep per notebook hash.
+const MAX_SNAPSHOTS_PER_NOTEBOOK: usize = 5;
+
+/// Snapshot a persisted automerge doc before deleting it.
+///
+/// Copies the file to `{docs_dir}/snapshots/{stem}-{millis}.automerge`
+/// and prunes old snapshots beyond `MAX_SNAPSHOTS_PER_NOTEBOOK`.
+///
+/// Returns `true` if the snapshot was created successfully. The caller
+/// should only delete the original file when this returns `true`.
+fn snapshot_before_delete(persist_path: &Path, docs_dir: &Path) -> bool {
+    let Some(stem) = persist_path.file_stem().and_then(|s| s.to_str()) else {
+        return false;
+    };
+
+    let snapshots_dir = docs_dir.join("snapshots");
+    if let Err(e) = std::fs::create_dir_all(&snapshots_dir) {
+        warn!(
+            "[notebook-sync] Failed to create snapshots dir {:?}: {}",
+            snapshots_dir, e
+        );
+        return false;
+    }
+
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let snapshot_name = format!("{}-{}.automerge", stem, timestamp);
+    let snapshot_path = snapshots_dir.join(&snapshot_name);
+
+    match std::fs::copy(persist_path, &snapshot_path) {
+        Ok(_) => {
+            info!(
+                "[notebook-sync] Snapshotted persisted doc before refresh: {:?}",
+                snapshot_path
+            );
+        }
+        Err(e) => {
+            warn!(
+                "[notebook-sync] Failed to snapshot {:?}: {}",
+                persist_path, e
+            );
+            return false;
+        }
+    }
+
+    // Prune old snapshots for this hash (keep most recent MAX_SNAPSHOTS_PER_NOTEBOOK)
+    let prefix = format!("{}-", stem);
+    let mut snapshots: Vec<_> = std::fs::read_dir(&snapshots_dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with(&prefix) && name.ends_with(".automerge"))
+        })
+        .collect();
+
+    if snapshots.len() > MAX_SNAPSHOTS_PER_NOTEBOOK {
+        // Sort by filename (which embeds timestamp) — ascending order
+        snapshots.sort_by_key(|e| e.file_name());
+        for entry in &snapshots[..snapshots.len() - MAX_SNAPSHOTS_PER_NOTEBOOK] {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+
+    true
+}
+
 impl NotebookRoom {
     /// Create a fresh room, ignoring any persisted state.
     ///
@@ -558,11 +629,14 @@ impl NotebookRoom {
             NotebookDoc::load_or_create_with_actor(&persist_path, notebook_id, runtimed_actor)
         } else {
             if persist_path.exists() {
-                info!(
-                    "[notebook-sync] Deleting stale persisted doc: {:?}",
-                    persist_path
-                );
-                let _ = std::fs::remove_file(&persist_path);
+                if snapshot_before_delete(&persist_path, docs_dir) {
+                    let _ = std::fs::remove_file(&persist_path);
+                } else {
+                    warn!(
+                        "[notebook-sync] Keeping persisted doc (snapshot failed): {:?}",
+                        persist_path
+                    );
+                }
             }
             NotebookDoc::new_with_actor(notebook_id, runtimed_actor)
         };
