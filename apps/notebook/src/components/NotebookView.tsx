@@ -199,6 +199,17 @@ function CellDragPreview({ cell }: { cell: NotebookCell | undefined }) {
   );
 }
 
+/** Check if a cell has both source and outputs hidden via metadata.
+ *  We intentionally don't check outputs.length so cells stay collapsed
+ *  when outputs are transiently cleared during re-execution. */
+function isCellFullyHidden(cell: NotebookCell): boolean {
+  if (cell.cell_type !== "code") return false;
+  const jupyter = cell.metadata?.jupyter as
+    | { source_hidden?: boolean; outputs_hidden?: boolean }
+    | undefined;
+  return jupyter?.source_hidden === true && jupyter?.outputs_hidden === true;
+}
+
 /** Wrapper component for sortable cells */
 function SortableCell({
   cell,
@@ -206,6 +217,7 @@ function SortableCell({
   renderCell,
   onAddCell,
   onDeleteCell,
+  isHiddenInGroup,
 }: {
   cell: NotebookCell;
   index: number;
@@ -217,6 +229,7 @@ function SortableCell({
   ) => React.ReactNode;
   onAddCell: (type: "code" | "markdown", afterCellId?: string | null) => void;
   onDeleteCell: (cellId: string) => void;
+  isHiddenInGroup?: boolean;
 }) {
   const {
     attributes,
@@ -238,6 +251,10 @@ function SortableCell({
     ...listeners,
     ...attributes,
   };
+
+  if (isHiddenInGroup) {
+    return <div ref={setNodeRef} style={style} />;
+  }
 
   return (
     <div ref={setNodeRef} style={style}>
@@ -332,6 +349,35 @@ function NotebookViewContent({
   // Memoize cell IDs array
   const cellIds = useMemo(() => cells.map((c) => c.id), [cells]);
 
+  // Compute consecutive groups of fully-hidden cells
+  // Maps cell ID → { count, isFirst, groupCellIds }
+  const hiddenGroups = useMemo(() => {
+    const groups = new Map<
+      string,
+      { count: number; isFirst: boolean; groupCellIds: string[] }
+    >();
+    let i = 0;
+    while (i < cells.length) {
+      if (isCellFullyHidden(cells[i])) {
+        const groupCellIds: string[] = [];
+        while (i < cells.length && isCellFullyHidden(cells[i])) {
+          groupCellIds.push(cells[i].id);
+          i++;
+        }
+        for (let j = 0; j < groupCellIds.length; j++) {
+          groups.set(groupCellIds[j], {
+            count: groupCellIds.length,
+            isFirst: j === 0,
+            groupCellIds,
+          });
+        }
+      } else {
+        i++;
+      }
+    }
+    return groups;
+  }, [cells]);
+
   // Compute the cell ID that precedes the focused cell (keeps its output bright)
   const previousCellId = useMemo(() => {
     if (!focusedCellId) return null;
@@ -386,13 +432,22 @@ function NotebookViewContent({
       const isFocused = cell.id === focusedCellId;
       const isExecuting = executingCellIds.has(cell.id);
 
-      // Navigation callbacks
+      // Navigation callbacks — skip cells that are collapsed into a hidden group
+      const isVisibleCell = (id: string) => {
+        const g = hiddenGroups.get(id);
+        return !g || g.isFirst;
+      };
+
       const onFocusPrevious = (cursorPosition: "start" | "end") => {
         logger.debug(
           `[cell-nav] onFocusPrevious called: cell=${cell.id.slice(0, 8)} index=${index} cellIds=${cellIds.map((id) => id.slice(0, 8)).join(",")}`,
         );
-        if (index > 0) {
-          const prevCellId = cellIds[index - 1];
+        let prevIndex = index - 1;
+        while (prevIndex >= 0 && !isVisibleCell(cellIds[prevIndex])) {
+          prevIndex--;
+        }
+        if (prevIndex >= 0) {
+          const prevCellId = cellIds[prevIndex];
           logger.debug(
             `[cell-nav] Focusing previous: ${prevCellId.slice(0, 8)}`,
           );
@@ -407,8 +462,15 @@ function NotebookViewContent({
         logger.debug(
           `[cell-nav] onFocusNext called: cell=${cell.id.slice(0, 8)} index=${index} cellIds=${cellIds.map((id) => id.slice(0, 8)).join(",")}`,
         );
-        if (index < cellIds.length - 1) {
-          const nextCellId = cellIds[index + 1];
+        let nextIndex = index + 1;
+        while (
+          nextIndex < cellIds.length &&
+          !isVisibleCell(cellIds[nextIndex])
+        ) {
+          nextIndex++;
+        }
+        if (nextIndex < cellIds.length) {
+          const nextCellId = cellIds[nextIndex];
           logger.debug(`[cell-nav] Focusing next: ${nextCellId.slice(0, 8)}`);
           onFocusCell(nextCellId);
           focusCell(nextCellId, cursorPosition);
@@ -464,6 +526,27 @@ function NotebookViewContent({
             onToggleOutputsHidden={
               onSetCellOutputsHidden
                 ? (hidden: boolean) => onSetCellOutputsHidden(cell.id, hidden)
+                : undefined
+            }
+            hiddenGroupCount={hiddenGroups.get(cell.id)?.count}
+            isGroupExecuting={
+              hiddenGroups
+                .get(cell.id)
+                ?.groupCellIds.some((id) => executingCellIds.has(id)) ?? false
+            }
+            onExpandHiddenGroup={
+              hiddenGroups.has(cell.id) &&
+              onSetCellSourceHidden &&
+              onSetCellOutputsHidden
+                ? () => {
+                    const group = hiddenGroups.get(cell.id);
+                    if (group) {
+                      for (const id of group.groupCellIds) {
+                        onSetCellSourceHidden(id, false);
+                        onSetCellOutputsHidden(id, false);
+                      }
+                    }
+                  }
                 : undefined
             }
           />
@@ -531,6 +614,7 @@ function NotebookViewContent({
       onReportOutputMatchCount,
       onSetCellSourceHidden,
       onSetCellOutputsHidden,
+      hiddenGroups,
       focusCell,
     ],
   );
@@ -584,16 +668,20 @@ function NotebookViewContent({
             items={cellIds}
             strategy={verticalListSortingStrategy}
           >
-            {cells.map((cell, index) => (
-              <SortableCell
-                key={cell.id}
-                cell={cell}
-                index={index}
-                renderCell={renderCell}
-                onAddCell={onAddCell}
-                onDeleteCell={onDeleteCell}
-              />
-            ))}
+            {cells.map((cell, index) => {
+              const group = hiddenGroups.get(cell.id);
+              return (
+                <SortableCell
+                  key={cell.id}
+                  cell={cell}
+                  index={index}
+                  renderCell={renderCell}
+                  onAddCell={onAddCell}
+                  onDeleteCell={onDeleteCell}
+                  isHiddenInGroup={group != null && !group.isFirst}
+                />
+              );
+            })}
           </SortableContext>
           <DragOverlay>
             {activeCell && <CellDragPreview cell={activeCell} />}
