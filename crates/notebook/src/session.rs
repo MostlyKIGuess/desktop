@@ -7,6 +7,7 @@ use crate::WindowNotebookRegistry;
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use tauri::Manager;
 
 /// Represents a single window's session state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -20,6 +21,11 @@ pub struct WindowSession {
     pub env_id: Option<String>,
     /// Runtime type (python, deno)
     pub runtime: String,
+    /// Scale factor of the monitor when this window was saved.
+    /// Used to correct physical pixel dimensions when restoring on a
+    /// monitor with a different scale factor (e.g., 1x external → 2x Retina).
+    #[serde(default)]
+    pub scale_factor: Option<f64>,
 }
 
 /// Complete application session state.
@@ -42,13 +48,17 @@ impl SessionState {
 }
 
 /// Save the current session state to disk.
-pub(crate) fn save_session(registry: &WindowNotebookRegistry) -> Result<(), String> {
-    save_session_to(registry, &runtimed::session_state_path())
+pub(crate) fn save_session<R: tauri::Runtime>(
+    registry: &WindowNotebookRegistry,
+    app: &tauri::AppHandle<R>,
+) -> Result<(), String> {
+    save_session_to(registry, app, &runtimed::session_state_path())
 }
 
 /// Save the current session state to a specific path.
-pub(crate) fn save_session_to(
+pub(crate) fn save_session_to<R: tauri::Runtime>(
     registry: &WindowNotebookRegistry,
+    app: &tauri::AppHandle<R>,
     dest: &std::path::Path,
 ) -> Result<(), String> {
     let contexts = registry.contexts.lock().map_err(|e| e.to_string())?;
@@ -67,15 +77,56 @@ pub(crate) fn save_session_to(
                 None
             };
 
+            let scale_factor = app
+                .get_webview_window(label)
+                .and_then(|w| w.scale_factor().ok());
+
             Some(WindowSession {
                 label: label.clone(),
                 path,
                 env_id,
                 runtime: context.runtime.to_string(),
+                scale_factor,
             })
         })
         .collect();
 
+    write_session(windows, dest)
+}
+
+/// Build session windows from registry without scale factor info (for tests).
+#[cfg(test)]
+pub(crate) fn save_session_to_without_scale(
+    registry: &WindowNotebookRegistry,
+    dest: &std::path::Path,
+) -> Result<(), String> {
+    let contexts = registry.contexts.lock().map_err(|e| e.to_string())?;
+
+    let windows: Vec<WindowSession> = contexts
+        .iter()
+        .filter_map(|(label, context)| {
+            let path = context.path.lock().ok()?.clone();
+            let notebook_id = context.notebook_id.lock().ok()?.clone();
+            let env_id = if path.is_none() && !notebook_id.is_empty() {
+                Some(notebook_id)
+            } else {
+                None
+            };
+            Some(WindowSession {
+                label: label.clone(),
+                path,
+                env_id,
+                runtime: context.runtime.to_string(),
+                scale_factor: None,
+            })
+        })
+        .collect();
+
+    write_session(windows, dest)
+}
+
+/// Write a list of window sessions to disk.
+fn write_session(windows: Vec<WindowSession>, dest: &std::path::Path) -> Result<(), String> {
     if windows.is_empty() {
         info!("[session] No windows to save");
         return Ok(());
@@ -151,6 +202,19 @@ pub(crate) fn load_session_from(path: &std::path::Path) -> Option<SessionState> 
         session.windows.len()
     );
     Some(session)
+}
+
+/// Load session state ignoring the age check.
+///
+/// Used for one-time migrations (e.g., renaming stale window labels) where
+/// the session data is needed even if it would be too old for restore.
+pub fn load_session_ignoring_age() -> Option<SessionState> {
+    let path = runtimed::session_state_path();
+    if !path.exists() {
+        return None;
+    }
+    let contents = std::fs::read_to_string(&path).ok()?;
+    serde_json::from_str(&contents).ok()
 }
 
 /// Delete the session file after successful restore.
@@ -235,7 +299,7 @@ mod tests {
             ("notebook-abc12345", test_context(None, "env-uuid-1234")),
         ]);
 
-        save_session_to(&registry, &session_path).unwrap();
+        save_session_to_without_scale(&registry, &session_path).unwrap();
         assert!(session_path.exists());
 
         let loaded = load_session_from(&session_path).unwrap();
@@ -266,7 +330,7 @@ mod tests {
         let session_path = dir.path().join("session.json");
 
         let registry = test_registry(vec![]);
-        save_session_to(&registry, &session_path).unwrap();
+        save_session_to_without_scale(&registry, &session_path).unwrap();
 
         // Empty registry should not create a session file
         assert!(!session_path.exists());
@@ -302,6 +366,7 @@ mod tests {
                 path: None,
                 env_id: Some("test".to_string()),
                 runtime: "python".to_string(),
+                scale_factor: None,
             }],
         };
         let json = serde_json::to_string_pretty(&session).unwrap();
@@ -316,7 +381,7 @@ mod tests {
         let session_path = dir.path().join("session.json");
 
         let registry = test_registry(vec![("notebook-env12345", test_context(None, "env-id"))]);
-        save_session_to(&registry, &session_path).unwrap();
+        save_session_to_without_scale(&registry, &session_path).unwrap();
         assert!(session_path.exists());
 
         clear_session_at(&session_path);
@@ -330,6 +395,7 @@ mod tests {
             path: Some(PathBuf::from("/tmp/test.ipynb")),
             env_id: None,
             runtime: "python".to_string(),
+            scale_factor: None,
         };
 
         let label1 = window_label_for_session(&session);
@@ -345,6 +411,7 @@ mod tests {
             path: None,
             env_id: Some("abcdef1234567890".to_string()),
             runtime: "python".to_string(),
+            scale_factor: None,
         };
         assert_eq!(window_label_for_session(&session), "notebook-abcdef12");
     }
@@ -384,7 +451,7 @@ mod tests {
             .contains_key("notebook-ghost"));
 
         // Save after pruning — session must only contain the 2 live windows
-        save_session_to(&registry, &session_path).unwrap();
+        save_session_to_without_scale(&registry, &session_path).unwrap();
         let loaded = load_session_from(&session_path).unwrap();
 
         assert_eq!(loaded.windows.len(), 2);
