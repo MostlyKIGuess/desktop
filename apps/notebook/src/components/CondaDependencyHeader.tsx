@@ -32,6 +32,8 @@ interface CondaDependencyHeaderProps {
   onSetChannels: (channels: string[]) => Promise<void>;
   onSetPython: (python: string | null) => Promise<void>;
   onSyncNow: () => Promise<boolean>;
+  /** Re-launch kernel (used for retry after env creation failure) */
+  onRetryLaunch?: () => Promise<boolean>;
   /** Environment preparation progress state */
   envProgress?: EnvProgressState | null;
   /** Callback to reset/dismiss error state */
@@ -61,6 +63,7 @@ export function CondaDependencyHeader({
   onSetChannels,
   onSetPython,
   onSyncNow,
+  onRetryLaunch,
   envProgress,
   onResetProgress,
   environmentYmlInfo,
@@ -92,19 +95,28 @@ export function CondaDependencyHeader({
 
   const handleAddChannel = useCallback(async () => {
     if (newChannel.trim()) {
-      const updated = [...channels, newChannel.trim()];
+      const trimmed = newChannel.trim();
+      let updated: string[];
+      if (channels.length === 0 && trimmed !== "conda-forge") {
+        // Preserve the implicit conda-forge default as an explicit channel
+        updated = ["conda-forge", trimmed];
+      } else {
+        updated = [...channels, trimmed];
+      }
+      onResetProgress?.();
       await onSetChannels(updated);
       setNewChannel("");
       setShowChannelInput(false);
     }
-  }, [newChannel, channels, onSetChannels]);
+  }, [newChannel, channels, onSetChannels, onResetProgress]);
 
   const handleRemoveChannel = useCallback(
     async (channel: string) => {
       const updated = channels.filter((c) => c !== channel);
+      onResetProgress?.();
       await onSetChannels(updated);
     },
-    [channels, onSetChannels],
+    [channels, onSetChannels, onResetProgress],
   );
 
   const handlePythonChange = useCallback(
@@ -117,6 +129,7 @@ export function CondaDependencyHeader({
 
   // Default channels if none specified
   const displayChannels = channels.length > 0 ? channels : ["conda-forge"];
+  const isUsingDefault = channels.length === 0;
 
   // Calculate progress percentage
   const progressPercent =
@@ -169,17 +182,35 @@ export function CondaDependencyHeader({
                 <pre className="mt-1 whitespace-pre-wrap font-mono text-[10px] opacity-80 overflow-x-auto">
                   {envProgress.error}
                 </pre>
+                <div className="mt-2 text-[11px] text-red-600/80 dark:text-red-400/80">
+                  Fix channels or dependencies above, then retry.
+                </div>
               </div>
-              {onResetProgress && (
+              <div className="flex items-center gap-1 shrink-0">
                 <button
                   type="button"
-                  onClick={onResetProgress}
-                  className="text-red-500 hover:text-red-700 dark:hover:text-red-300 shrink-0"
-                  title="Dismiss"
+                  disabled={syncing || loading}
+                  onClick={() => {
+                    onResetProgress?.();
+                    (onRetryLaunch ?? onSyncNow)();
+                  }}
+                  className="flex items-center gap-1 rounded bg-red-600 px-2 py-0.5 text-white text-xs font-medium hover:bg-red-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                  title="Retry environment creation"
                 >
-                  <X className="h-3 w-3" />
+                  <RefreshCw className="h-3 w-3" />
+                  Retry
                 </button>
-              )}
+                {onResetProgress && (
+                  <button
+                    type="button"
+                    onClick={onResetProgress}
+                    className="text-red-500 hover:text-red-700 dark:hover:text-red-300"
+                    title="Dismiss"
+                  >
+                    <X className="h-3 w-3" />
+                  </button>
+                )}
+              </div>
             </div>
           </div>
         )}
@@ -337,6 +368,11 @@ export function CondaDependencyHeader({
                 className="flex items-center gap-1 rounded bg-emerald-100 dark:bg-emerald-900/30 px-2 py-0.5 text-xs border border-emerald-200 dark:border-emerald-800"
               >
                 <span className="font-mono">{channel}</span>
+                {isUsingDefault && (
+                  <span className="text-[10px] text-muted-foreground ml-0.5">
+                    (default)
+                  </span>
+                )}
                 {channels.length > 0 && (
                   <button
                     type="button"
