@@ -84,32 +84,23 @@ export async function resolveOutput(
 }
 
 /**
- * Merge consecutive stream outputs sharing the same name (stdout/stderr).
- * Handles both `string` and `string[]` text formats.
+ * Return the previous outputs array if every element is referentially
+ * identical to the resolved outputs. This lets `cellsEqual()` short-circuit
+ * on `===` checks and skip React re-renders for cells whose outputs
+ * haven't actually changed (all cache hits, same order, same length).
  */
-export function mergeConsecutiveStreams(
-  outputs: JupyterOutput[],
+export function reuseOutputsIfUnchanged(
+  resolvedOutputs: JupyterOutput[],
+  previousOutputs: JupyterOutput[] | undefined,
 ): JupyterOutput[] {
-  return outputs.reduce<JupyterOutput[]>((merged, output) => {
-    if (output.output_type === "stream" && merged.length > 0) {
-      const last = merged[merged.length - 1];
-      if (last.output_type === "stream" && last.name === output.name) {
-        const lastText = Array.isArray(last.text)
-          ? last.text.join("")
-          : last.text;
-        const outputText = Array.isArray(output.text)
-          ? output.text.join("")
-          : output.text;
-        merged[merged.length - 1] = {
-          ...last,
-          text: lastText + outputText,
-        };
-        return merged;
-      }
-    }
-    merged.push(output);
-    return merged;
-  }, []);
+  if (
+    previousOutputs &&
+    previousOutputs.length === resolvedOutputs.length &&
+    previousOutputs.every((o, i) => o === resolvedOutputs[i])
+  ) {
+    return previousOutputs;
+  }
+  return resolvedOutputs;
 }
 
 /**
@@ -162,14 +153,12 @@ export function cellSnapshotsToNotebookCellsSync(
         })
         .filter((o): o is JupyterOutput => o !== null);
 
-      const outputs = mergeConsecutiveStreams(resolvedOutputs);
-
       return {
         id: snap.id,
         cell_type: "code" as const,
         source: snap.source,
         execution_count: Number.isNaN(executionCount) ? null : executionCount,
-        outputs,
+        outputs: resolvedOutputs,
         metadata,
       };
     }
@@ -223,15 +212,12 @@ export async function cellSnapshotsToNotebookCells(
           )
         ).filter((o): o is JupyterOutput => o !== null);
 
-        // Merge consecutive stream outputs as a fallback for unmerged data
-        const outputs = mergeConsecutiveStreams(resolvedOutputs);
-
         return {
           id: snap.id,
           cell_type: "code" as const,
           source: snap.source,
           execution_count: Number.isNaN(executionCount) ? null : executionCount,
-          outputs,
+          outputs: resolvedOutputs,
           metadata,
         };
       }
@@ -299,12 +285,16 @@ export function materializeCellFromWasm(
       })
       .filter((o): o is JupyterOutput => o !== null);
 
+    const prevOutputs =
+      previousCell?.cell_type === "code" ? previousCell.outputs : undefined;
+    const outputs = reuseOutputsIfUnchanged(resolvedOutputs, prevOutputs);
+
     return {
       id: cellId,
       cell_type: "code",
       source,
       execution_count: Number.isNaN(executionCount) ? null : executionCount,
-      outputs: mergeConsecutiveStreams(resolvedOutputs),
+      outputs,
       metadata,
     };
   }
