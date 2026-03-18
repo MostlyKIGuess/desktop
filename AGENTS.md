@@ -472,19 +472,75 @@ The Tauri app crate (`crates/notebook/`) is the glue — it wires Tauri commands
 
 ### Blob Store and Output Manifests
 
-Large binary outputs (images, plots, HTML) are stored in a content-addressed blob store, not inline in the CRDT. The Automerge doc carries only 64-char SHA-256 hashes.
+Large outputs (images, plots, HTML) are stored in a content-addressed blob store, not inline in the CRDT. The Automerge doc carries only 64-char SHA-256 hashes.
 
 **Two-tier indirection:**
 1. **Cell outputs list** → manifest hashes (64-char hex strings in `doc.cells[id].outputs`)
-2. **Manifest** (JSON in blob store) → `ContentRef` per MIME type: `{"inline": "<data>"}` for ≤8KB, `{"blob": "<hash>", "size": N}` for >8KB
+2. **Manifest** (JSON in blob store) → `ContentRef` per MIME type: `{"inline": "<data>"}` for ≤8KB text, `{"blob": "<hash>", "size": N}` for large text or ANY binary content
 
-**Blob store location:** `~/.cache/runt/blobs/` (sharded by first 2 hex chars). Each blob has a `.meta` sidecar with `{media_type, size}`.
+#### Binary vs Text Content — CRITICAL DISTINCTION
 
-**Blob HTTP server:** `127.0.0.1:<dynamic-port>`, serves `GET /blob/{hash}`. The port is included in the connection capabilities and available via `runt daemon status --json | jq -r .blob_url`.
+Jupyter kernels send binary data (images, etc.) as base64-encoded strings on the wire. The daemon **base64-decodes binary MIME types before storing** so the blob store holds actual binary bytes (real PNG, JPEG, etc.), not base64 text.
 
-**Frontend resolution:** `materialize-cells.ts` resolves manifest hashes → fetches manifest JSON from HTTP → resolves `ContentRef::Blob` entries → renders. An output cache deduplicates fetches.
+**Text MIME types** (`text/*`, `application/json`, `image/svg+xml`, anything `+json`/`+xml`):
+- Stored as UTF-8 string bytes in the blob store (or inlined if < 8KB)
+- Resolved via `read_to_string()` / `response.text()`
 
-**Key files:** `crates/runtimed/src/output_store.rs` (manifest creation, inlining threshold), `crates/runtimed/src/blob_store.rs` (content-addressed storage), `crates/runtimed/src/blob_server.rs` (HTTP server).
+**Binary MIME types** (`image/png`, `image/jpeg`, `audio/*`, `video/*`, most `application/*`):
+- Base64-decoded by the daemon before storage — blob contains raw bytes
+- **Always** stored as blobs (never inlined, regardless of size)
+- Frontend resolves to `http://` blob URLs — browser fetches raw bytes directly
+- Python resolver reads raw bytes then base64-encodes for the `Output` struct
+- Save-to-disk path reads raw bytes then base64-encodes for .ipynb format
+
+**Important exception:** `image/svg+xml` is **TEXT**, not binary. Jupyter sends SVG as plain XML strings. The `+xml` suffix is the tell.
+
+#### The `is_binary_mime` Contract
+
+Three implementations **must stay in sync**:
+
+| Location | Language | Function |
+|----------|----------|----------|
+| `crates/runtimed/src/output_store.rs` | Rust | `is_binary_mime()` |
+| `crates/runtimed-py/src/output_resolver.rs` | Rust | `is_binary_mime()` |
+| `apps/notebook/src/lib/manifest-resolution.ts` | TypeScript | `isBinaryMime()` |
+
+The rule:
+- `image/*` → binary, **EXCEPT** `image/svg+xml` (plain XML text)
+- `audio/*`, `video/*` → always binary
+- `application/*` → binary by default, **EXCEPT**: `json`, `javascript`, `ecmascript`, `xml`, `xhtml+xml`, `mathml+xml`, `sql`, `graphql`, `x-latex`, `x-tex`, and anything ending in `+json` or `+xml`
+- `text/*` → always text
+- Everything else → text
+
+**If you add a new MIME type classification, update all three.**
+
+#### Common Pitfalls
+
+1. **"I'll store the base64 string directly"** — No. Binary MIME types must be base64-decoded before storing. Otherwise the blob server serves base64 text with `Content-Type: image/png` (wrong), and `<img src="blob-url">` fails.
+
+2. **"I'll use `read_to_string()` for all blobs"** — No. Binary blobs are raw bytes, not valid UTF-8. Check `is_binary_mime()` and use byte-mode reads, then base64-encode if the consumer needs a string.
+
+3. **"SVG is an image, so it's binary"** — No. Jupyter sends SVG as plain XML text. The `+xml` suffix means text.
+
+4. **"ContentRef needs a binary flag"** — It doesn't. The MIME type (the key in the manifest's `data` map) determines text vs binary. ContentRef is format-agnostic.
+
+#### Resolution by Consumer
+
+| Consumer | Binary MIME resolution | Text MIME resolution |
+|----------|----------------------|---------------------|
+| **Frontend** (`manifest-resolution.ts`) | Returns `http://` blob URL (browser fetches raw bytes) | `response.text()` → string |
+| **Python** (`output_resolver.rs`) | `tokio::fs::read()` → base64-encode | `read_to_string()` → string |
+| **.ipynb save** (`output_store.rs`) | `resolve_binary_as_base64()` → base64 string | `resolve()` → UTF-8 string |
+
+#### Infrastructure Details
+
+**Blob store location:** `~/.cache/runt/blobs/` (sharded by first 2 hex chars). Each blob has a `.meta` sidecar with `{media_type, size, created_at}`. Blobs are ephemeral — derived from notebook content, not the source of truth. On daemon restart, blobs are regenerated from .ipynb files. No migration needed on upgrade.
+
+**Blob HTTP server:** `127.0.0.1:<dynamic-port>`, serves `GET /blob/{hash}` with `Content-Type` from `.meta`, `Cache-Control: immutable`. Port available via `runt daemon status --json | jq -r .blob_url`.
+
+**Frontend resolution:** `manifest-resolution.ts` resolves manifest hashes → fetches manifest JSON → resolves `ContentRef` entries (text as strings, binary as blob URLs) → renders. An output cache deduplicates fetches.
+
+**Key files:** `crates/runtimed/src/output_store.rs` (manifest creation/resolution, `is_binary_mime`, `ContentRef`), `crates/runtimed/src/blob_store.rs` (content-addressed storage), `crates/runtimed/src/blob_server.rs` (HTTP server), `crates/runtimed-py/src/output_resolver.rs` (Python-side resolution), `apps/notebook/src/lib/manifest-resolution.ts` (frontend resolution, `isBinaryMime`).
 
 ### Notebook Room Lifecycle
 

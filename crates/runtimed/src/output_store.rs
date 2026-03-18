@@ -1,19 +1,47 @@
-//! Output store: manifests, ContentRef, and inlining for notebook outputs.
-//!
-//! This module provides the foundation for Phase 6 output handling:
-//! - `ContentRef`: a reference to content that may be inlined or stored in the blob store
-//! - Output manifests: Jupyter output types with `ContentRef` for data fields
-//! - Inlining threshold: small data is inlined, large data goes to blob store
+//! Output store: manifests, ContentRef, and blob storage for notebook outputs.
 //!
 //! ## Design
 //!
 //! Instead of storing full Jupyter outputs as JSON strings in the CRDT (which
 //! causes bloat for images and large outputs), we store output manifests that
-//! reference content via `ContentRef`. Small content (< 8KB by default) is
-//! inlined in the manifest. Large content is stored in the blob store.
+//! reference content via [`ContentRef`]. The manifest is itself stored in the
+//! blob store with media type `application/x-jupyter-output+json`, and its
+//! SHA-256 hash is what goes into the Automerge CRDT cell outputs list.
 //!
-//! The manifest is itself stored in the blob store with media type
-//! `application/x-jupyter-output+json`, and its hash is stored in the CRDT.
+//! ## Text vs Binary Content
+//!
+//! Content is classified by MIME type via [`is_binary_mime()`]:
+//!
+//! **Text** (`text/*`, `application/json`, `image/svg+xml`, `+json`, `+xml`):
+//! - Stored as UTF-8 string bytes in the blob store, or inlined if < 8KB
+//! - Resolved via [`ContentRef::resolve()`] → `String`
+//!
+//! **Binary** (`image/png`, `image/jpeg`, `audio/*`, `video/*`, most `application/*`):
+//! - Jupyter sends these as base64 on the wire; we **decode before storing**
+//! - Always stored as blobs (never inlined, regardless of size)
+//! - The blob store holds actual binary bytes (real PNG, JPEG, etc.)
+//! - Resolved via [`ContentRef::resolve_binary_as_base64()`] for the .ipynb
+//!   save path, or as `http://` blob URLs on the frontend
+//!
+//! **Important:** `image/svg+xml` is TEXT, not binary. Jupyter sends SVG as
+//! plain XML strings, not base64.
+//!
+//! ## The `is_binary_mime` Contract
+//!
+//! Three implementations must stay in sync:
+//! - Rust: `is_binary_mime()` in this file
+//! - Rust: `is_binary_mime()` in `crates/runtimed-py/src/output_resolver.rs`
+//! - TypeScript: `isBinaryMime()` in `apps/notebook/src/lib/manifest-resolution.ts`
+//!
+//! If you change the classification, update all three.
+//!
+//! ## Key Types
+//!
+//! - [`ContentRef`]: inline string or blob hash — format-agnostic, the MIME
+//!   type determines whether to read as text or binary
+//! - [`OutputManifest`]: Jupyter output with `ContentRef` fields
+//! - [`create_manifest()`]: nbformat JSON → manifest (decodes binary, stores blobs)
+//! - [`resolve_manifest()`]: manifest → nbformat JSON (re-encodes binary to base64)
 
 use std::collections::HashMap;
 use std::io;

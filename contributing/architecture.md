@@ -79,25 +79,73 @@ The blob store uses content-addressed storage at `~/.cache/runt/blobs/`. Each bl
 ```
 ~/.cache/runt/blobs/
   a1/
-    b2c3d4...       # raw bytes
+    b2c3d4...       # raw bytes (actual PNG, UTF-8 text, etc.)
     b2c3d4....meta  # JSON metadata (media_type, size, created_at)
 ```
 
-Data flow:
-1. Kernel produces output → daemon's `output_store.rs` receives it
-2. Large data (images, HTML) goes to `blob_store.rs` → returns hash
-3. Daemon broadcasts `OutputManifest` with `ContentRef` (either `{ inline: "..." }` or `{ blob: "hash", size: N }`)
-4. Frontend's `manifest-resolution.ts` checks `isManifestHash()` on output data
-5. Blob refs are fetched from `blob_server.rs` via `http://127.0.0.1:{port}/blob/{hash}`
-6. `materialize-cells.ts` converts resolved outputs to React-renderable `NotebookCell[]`
+#### Text vs Binary Content — Critical Distinction
+
+Jupyter kernels send binary data (images) as base64-encoded strings on the wire. The daemon **base64-decodes binary MIME types before storing** so the blob store holds actual binary bytes (real PNG, JPEG, etc.), not base64 text. This classification is determined by `is_binary_mime()`.
+
+**Text MIME types** (`text/*`, `application/json`, `image/svg+xml`, anything `+json`/`+xml`):
+- Stored as UTF-8 string bytes (or inlined in the manifest if < 8KB)
+- Resolved via `read_to_string()` / `response.text()`
+
+**Binary MIME types** (`image/png`, `image/jpeg`, `audio/*`, `video/*`, most `application/*`):
+- Base64-decoded by the daemon before storage — blob contains raw bytes
+- **Always** stored as blobs (never inlined, regardless of size)
+- Frontend resolves to `http://` blob URLs — browser fetches raw bytes directly via `<img src="...">`
+- Python resolver reads raw bytes then base64-encodes for the `Output` struct
+- Save-to-disk path reads raw bytes then base64-encodes for .ipynb format
+
+**Important exception:** `image/svg+xml` is **TEXT**, not binary. Jupyter sends SVG as plain XML strings. The `+xml` suffix is the tell.
+
+#### The `is_binary_mime` Contract
+
+Three implementations **must stay in sync** — if you change the classification, update all three:
+
+| Location | Language | Function |
+|----------|----------|----------|
+| `crates/runtimed/src/output_store.rs` | Rust | `is_binary_mime()` |
+| `crates/runtimed-py/src/output_resolver.rs` | Rust | `is_binary_mime()` |
+| `apps/notebook/src/lib/manifest-resolution.ts` | TypeScript | `isBinaryMime()` |
+
+The rule:
+- `image/*` → binary, **EXCEPT** `image/svg+xml` (plain XML text)
+- `audio/*`, `video/*` → always binary
+- `application/*` → binary by default, **EXCEPT**: `json`, `javascript`, `ecmascript`, `xml`, `xhtml+xml`, `mathml+xml`, `sql`, `graphql`, `x-latex`, `x-tex`, and anything ending in `+json` or `+xml`
+- `text/*` → always text
+
+#### Common Pitfalls
+
+1. **"I'll store the base64 string directly"** — No. Binary MIME types must be base64-decoded before storing. Otherwise the blob server serves base64 text with `Content-Type: image/png` (wrong), and `<img src="blob-url">` breaks.
+2. **"I'll use `read_to_string()` for all blobs"** — No. Binary blobs are raw bytes, not valid UTF-8. Check `is_binary_mime()` and use byte-mode reads, then base64-encode if the consumer needs a string.
+3. **"SVG is an image, so it's binary"** — No. Jupyter sends SVG as plain XML text. The `+xml` suffix means text.
+4. **"ContentRef needs a binary flag"** — It doesn't. The MIME type (the key in the manifest's `data` map) determines text vs binary. ContentRef is format-agnostic.
+
+#### Data Flow
+
+1. Kernel produces output → daemon's `kernel_manager.rs` converts to nbformat JSON
+2. `output_store.rs` creates manifest:
+   - Text MIME → `ContentRef::from_data()` (inline if < 8KB, blob if larger)
+   - Binary MIME → base64-decode → `ContentRef::from_binary()` (always blob)
+3. Manifest JSON stored in blob store → hash goes into Automerge CRDT
+
+Resolution varies by consumer:
+
+| Consumer | Binary MIME | Text MIME |
+|----------|------------|-----------|
+| **Frontend** (`manifest-resolution.ts`) | Returns `http://` blob URL | `response.text()` → string |
+| **Python** (`output_resolver.rs`) | `fs::read()` → base64-encode | `read_to_string()` → string |
+| **.ipynb save** (`output_store.rs`) | `resolve_binary_as_base64()` | `resolve()` → UTF-8 string |
 
 Key files:
+- `crates/runtimed/src/output_store.rs` — Manifest creation/resolution, `is_binary_mime()`, `ContentRef`
 - `crates/runtimed/src/blob_store.rs` — Content-addressed storage with atomic writes
-- `crates/runtimed/src/blob_server.rs` — HTTP server for blob retrieval
-- `crates/runtimed/src/output_store.rs` — Decides inline vs blob based on size threshold
-- `apps/notebook/src/lib/manifest-resolution.ts` — `resolveManifest()`, `resolveContentRef()`
+- `crates/runtimed/src/blob_server.rs` — HTTP server (`GET /blob/{hash}`, serves raw bytes with correct `Content-Type`)
+- `crates/runtimed-py/src/output_resolver.rs` — Python-side manifest resolution, `is_binary_mime()`
+- `apps/notebook/src/lib/manifest-resolution.ts` — Frontend resolution, `isBinaryMime()`, `resolveContentRef()`
 - `apps/notebook/src/lib/materialize-cells.ts` — Assembles cells with resolved outputs
-- `apps/notebook/src/hooks/useManifestResolver.ts` — React hook for lazy resolution
 
 ### 6. Daemon Manages Runtime Resources
 
@@ -186,7 +234,7 @@ The frontend now owns a local Automerge doc via `runtimed-wasm` WASM bindings, m
 - `crates/runtimed/src/notebook_sync_server.rs` — `NotebookRoom`, room lifecycle, autosave debouncer, re-keying, sync loop
 - `crates/runtimed/src/kernel_manager.rs` — Kernel process lifecycle, execution queue, IOPub output routing
 - `crates/runtimed/src/comm_state.rs` — Widget comm state + Output widget capture routing
-- `crates/runtimed/src/output_store.rs` — Output manifest creation, blob inlining threshold
+- `crates/runtimed/src/output_store.rs` — Output manifest creation/resolution, `is_binary_mime()`, `ContentRef`
 - `crates/notebook-sync/src/relay.rs` — `RelayHandle`: relay API for forwarding typed frames between WASM and daemon
 - `crates/notebook-sync/src/connect.rs` — `connect_open_relay()`, `connect_create_relay()`: transparent byte pipe setup
 - `crates/runtimed-wasm/src/lib.rs` — WASM bindings: local Automerge peer, frame demux, per-cell accessors, `CellChangeset`
