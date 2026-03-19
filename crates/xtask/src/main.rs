@@ -54,9 +54,10 @@ fn main() {
             let print_config = args.iter().any(|a| a == "--print-config");
             cmd_dev_mcp(print_config);
         }
-        "mcp" => {
+        "run-mcp" | "mcp" => {
             let print_config = args.iter().any(|a| a == "--print-config");
-            cmd_mcp(print_config);
+            let release = args.iter().any(|a| a == "--release");
+            cmd_mcp(print_config, release);
         }
         "lint" => {
             let fix = args.iter().any(|a| a == "--fix");
@@ -98,10 +99,10 @@ Daemon:
   dev-daemon [--release]     Build and run runtimed in per-worktree dev mode
 
 MCP:
-  mcp                        MCP supervisor (proxy + daemon + auto-restart)
-  mcp --print-config         Print MCP client config JSON (for Claude, Zed, etc.)
-  dev-mcp                    Build Python bindings and launch nteract MCP server
-  dev-mcp --print-config     Print MCP client config JSON (for Claude, Zed, etc.)
+  run-mcp [--release]        Build and run the Inkwell MCP supervisor (proxy + daemon + auto-restart)
+  run-mcp --print-config     Print MCP client config JSON (for Zed, Claude, etc.)
+  dev-mcp                    Build Python bindings and launch nteract MCP server directly (no supervisor)
+  dev-mcp --print-config     Print MCP client config JSON (for Zed, Claude, etc.)
 
 Linting:
   lint                       Check formatting and linting (Rust, JS/TS, Python)
@@ -416,6 +417,14 @@ fn cmd_build(rust_only: bool) {
     // Build runtimed daemon binary for bundling (debug mode for faster builds)
     build_runtimed_daemon(false);
 
+    // Build MCP supervisor binary
+    println!("Building MCP supervisor...");
+    run_cmd("cargo", &["build", "-p", "mcp-supervisor"]);
+
+    // Sync Python workspace and build native bindings (runtimed-py)
+    ensure_python_env();
+    ensure_maturin_develop();
+
     if rust_only {
         // Check that frontend dist exists
         let dist_dir = Path::new("apps/notebook/dist");
@@ -725,9 +734,16 @@ fn cmd_install_daemon() {
 ///
 /// This enables isolated daemon instances per git worktree, useful when
 /// developing/testing daemon code across multiple worktrees simultaneously.
-fn cmd_mcp(print_config: bool) {
+fn cmd_mcp(print_config: bool, release: bool) {
     ensure_python_env();
     ensure_maturin_develop();
+
+    // Build the daemon in the requested mode so the supervisor finds it
+    if release {
+        println!("Building runtimed (release) for supervisor...");
+        run_cmd("cargo", &["build", "--release", "-p", "runtimed"]);
+        run_cmd("cargo", &["build", "--release", "-p", "runt-cli"]);
+    }
 
     if print_config {
         // Build the supervisor, then run it with --print-config
@@ -742,12 +758,22 @@ fn cmd_mcp(print_config: bool) {
             eprintln!("Failed to resolve supervisor binary path: {e}");
             exit(1);
         });
-        let config = serde_json::json!({
-            "command": binary_path.to_string_lossy(),
-            "env": {
-                "RUNTIMED_DEV": "1"
-            }
-        });
+        let config = if release {
+            serde_json::json!({
+                "command": binary_path.to_string_lossy(),
+                "env": {
+                    "RUNTIMED_DEV": "1",
+                    "RUNTIMED_RELEASE": "1"
+                }
+            })
+        } else {
+            serde_json::json!({
+                "command": binary_path.to_string_lossy(),
+                "env": {
+                    "RUNTIMED_DEV": "1"
+                }
+            })
+        };
         println!(
             "{}",
             serde_json::to_string_pretty(&config).unwrap_or_else(|e| {
@@ -768,6 +794,9 @@ fn cmd_mcp(print_config: bool) {
 
     let mut command = Command::new(binary);
     apply_worktree_env(&mut command, true);
+    if release {
+        command.env("RUNTIMED_RELEASE", "1");
+    }
 
     let status = command.status().unwrap_or_else(|e| {
         eprintln!("Failed to run mcp-supervisor: {e}");
@@ -1191,24 +1220,22 @@ fn cmd_lint(fix: bool) {
     }
     println!();
 
-    // Rust clippy (check-only, no auto-fix available)
-    if !fix {
-        println!("=== Rust clippy ===");
-        if !run_cmd_ok(
-            "cargo",
-            &[
-                "clippy",
-                "--workspace",
-                "--all-targets",
-                "--",
-                "-D",
-                "warnings",
-            ],
-        ) {
-            failed = true;
-        }
-        println!();
+    // Rust clippy (always check-only — clippy doesn't auto-fix)
+    println!("=== Rust clippy ===");
+    if !run_cmd_ok(
+        "cargo",
+        &[
+            "clippy",
+            "--workspace",
+            "--all-targets",
+            "--",
+            "-D",
+            "warnings",
+        ],
+    ) {
+        failed = true;
     }
+    println!();
 
     // JavaScript/TypeScript with Biome
     println!("=== JavaScript/TypeScript (Biome) ===");
