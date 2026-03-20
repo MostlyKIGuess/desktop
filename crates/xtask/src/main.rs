@@ -393,6 +393,8 @@ fn ensure_maturin_develop() {
             "maturin",
             "develop",
         ])
+        .env("VIRTUAL_ENV", ".venv")
+        .env_remove("CONDA_PREFIX")
         .status();
 
     match status {
