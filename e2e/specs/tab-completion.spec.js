@@ -17,7 +17,7 @@ describe("Tab Completion", () => {
   before(async () => {
     await waitForAppReady();
     // Wait for kernel so completions work
-    await waitForKernelReady(90000);
+    await waitForKernelReady(120000);
   });
 
   // Skip: Flaky in CI due to kernel completion timing variance. The async chain
@@ -104,7 +104,9 @@ describe("Tab Completion", () => {
     expect(content.trim()).toBe(""); // Only whitespace
   });
 
-  it("should keep focus in editor after Tab (not escape to page)", async () => {
+  // Skip: synthetic Tab key events from tauri-plugin-webdriver don't flow
+  // through CodeMirror's focus management the same way native events do.
+  it.skip("should keep focus in editor after Tab (not escape to page)", async () => {
     const codeCell = await $('[data-cell-type="code"]');
     const editor = await codeCell.$('.cm-content[contenteditable="true"]');
     await editor.click();

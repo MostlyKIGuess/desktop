@@ -1,14 +1,12 @@
 /**
  * WebDriverIO configuration for Tauri E2E testing
  *
- * Supports two modes:
- *   1. Docker mode (default): Connects to tauri-driver inside a Docker container
- *      - pnpm test:e2e:docker
+ * Uses tauri-plugin-webdriver which embeds a W3C WebDriver server inside the
+ * app on port 4445 by default. No external tauri-driver process is needed.
  *
- *   2. Native mode (macOS): Connects to the app's built-in WebDriver server
- *      - Build: cargo build --features webdriver-test -p notebook
- *      - Run:   ./target/debug/notebook --webdriver-port $PORT
- *      - Test:  pnpm test:e2e:native
+ *   - Build: cargo build --features e2e-webdriver -p notebook
+ *   - Run:   ./target/debug/notebook (WebDriver server starts automatically)
+ *   - Test:  pnpm test:e2e:native
  */
 
 import fs from "node:fs";
@@ -30,6 +28,7 @@ fs.mkdirSync(SCREENSHOT_FAILURES_DIR, { recursive: true });
 // Fixture specs require special setup (NOTEBOOK_PATH or working directory) and are excluded
 // from the default run. Use ./e2e/dev.sh test-fixture or test-untitled-pyproject to run them.
 const FIXTURE_SPECS = [
+  "cell-visibility.spec.js", // Requires fixture notebook with pre-existing outputs
   "conda-inline.spec.js",
   "deno.spec.js",
   "prewarmed-uv.spec.js",
@@ -84,20 +83,11 @@ export const config = {
   maxInstances: 1,
 
   // Tauri WebDriver capabilities
+  // tauri-plugin-webdriver embeds the server inside the app — no external driver needed
   capabilities: [
     {
       // Tauri uses wry as the browser engine
       browserName: "wry",
-      "tauri:options": {
-        // In Docker mode: path to the compiled binary (tauri-driver launches it)
-        // In native mode: ignored (app is already running with --webdriver-port)
-        application:
-          process.env.TAURI_APP_PATH || "/app/target/release/notebook",
-        // Pass notebook path as arg to open a specific fixture
-        ...(process.env.NOTEBOOK_PATH
-          ? { args: [process.env.NOTEBOOK_PATH] }
-          : {}),
-      },
     },
   ],
 
@@ -107,7 +97,7 @@ export const config = {
     process.env.WEBDRIVER_PORT ||
       process.env.CONDUCTOR_PORT ||
       process.env.PORT ||
-      "4444",
+      "4445",
     10,
   ),
 
