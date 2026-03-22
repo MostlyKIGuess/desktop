@@ -47,8 +47,8 @@ await init(wasmBytes);
 /** Sync two handles until both return no more messages (convergence). */
 function syncHandles(a: NotebookHandle, b: NotebookHandle, maxRounds = 10) {
   for (let i = 0; i < maxRounds; i++) {
-    const msgA = a.generate_sync_message();
-    const msgB = b.generate_sync_message();
+    const msgA = a.flush_local_changes();
+    const msgB = b.flush_local_changes();
     if (!msgA && !msgB) break;
     if (msgA) b.receive_sync_message(msgA);
     if (msgB) a.receive_sync_message(msgB);
@@ -338,7 +338,7 @@ Deno.test("Sync: delete cell syncs correctly", () => {
   client.free();
 });
 
-Deno.test("Sync: generate_sync_message returns null when in sync", () => {
+Deno.test("Sync: flush_local_changes returns null when in sync", () => {
   const server = new NotebookHandle("sync-test");
   const client = NotebookHandle.load(server.save());
 
@@ -346,8 +346,561 @@ Deno.test("Sync: generate_sync_message returns null when in sync", () => {
   syncHandles(server, client);
 
   // Both should report no message needed
-  assertEquals(server.generate_sync_message(), undefined);
-  assertEquals(client.generate_sync_message(), undefined);
+  assertEquals(server.flush_local_changes(), undefined);
+  assertEquals(client.flush_local_changes(), undefined);
+
+  server.free();
+  client.free();
+});
+
+// ── Bug reproduction: #1067 — sync head divergence ───────────────────
+
+Deno.test("Bug #1067: consumed sync message causes protocol stall", () => {
+  // Reproduces the rapid Ctrl+Enter bug where flushSync() calls
+  // generate_sync_message() (advancing sync_state) but the message
+  // is never delivered to the server. The sync protocol stalls because
+  // sync_state believes the message was sent.
+  //
+  // This simulates:
+  //   1. Server makes a change (kernel writes output)
+  //   2. Client receives the sync message (WASM applies it)
+  //   3. Client calls generate_sync_message() — like flushSync() does
+  //   4. The message is DROPPED (simulating failed/delayed sendFrame)
+  //   5. Server makes another change
+  //   6. Client should still be able to sync — but can't
+
+  const server = new NotebookHandle("stall-test");
+  server.add_cell(0, "cell-1", "code");
+
+  const client = NotebookHandle.load(server.save());
+  syncHandles(server, client);
+
+  // Step 1: Server makes a change (simulates daemon writing output)
+  server.update_source("cell-1", "output-v1");
+
+  // Step 2: Client receives the server's sync message
+  const serverMsg1 = server.flush_local_changes();
+  assert(serverMsg1 !== undefined, "server should have a sync message");
+  const changed = client.receive_sync_message(serverMsg1);
+  assert(changed, "client doc should have changed");
+
+  // Step 3: Client generates a reply — like flushSync() does.
+  // This ADVANCES client's sync_state.last_sent_heads.
+  const consumedReply = client.flush_local_changes();
+  assert(consumedReply !== undefined, "client should have a reply");
+
+  // Step 4: The reply is DROPPED. Never delivered to server.
+  // (Simulates sendFrame failing or being blocked by the relay mutex)
+
+  // Step 5: Server makes another change
+  server.update_source("cell-1", "output-v2");
+
+  // Step 6: Try to sync. The client's sync_state thinks it already
+  // sent a reply for output-v1, so generate_sync_message may return
+  // nothing — even though the server never received the reply.
+  //
+  // Meanwhile, the server sends its new change. Let's see if the
+  // protocol can recover.
+  const serverMsg2 = server.flush_local_changes();
+  assert(serverMsg2 !== undefined, "server should have msg for output-v2");
+  client.receive_sync_message(serverMsg2);
+
+  // The client should now generate a reply that covers BOTH the
+  // previously-dropped reply AND the new change.
+  const recoveryReply = client.flush_local_changes();
+
+  // THIS IS THE BUG: if recoveryReply is undefined, the protocol has
+  // stalled. The client thinks it's in sync (because sync_state was
+  // advanced by the dropped message) but the server disagrees.
+  //
+  // If Automerge's sync protocol is resilient to this, recoveryReply
+  // will be defined and delivering it will converge the two docs.
+  if (recoveryReply === undefined) {
+    // Protocol stalled — this is the bug.
+    // Verify the docs have diverged.
+    const serverCell = server.get_cell("cell-1");
+    const clientCell = client.get_cell("cell-1");
+    assertExists(serverCell);
+    assertExists(clientCell);
+
+    // Client should have output-v2 (it received the sync message)
+    assertEquals(clientCell.source, "output-v2");
+    clientCell.free();
+
+    // Server should also have output-v2 (it wrote it)
+    assertEquals(serverCell.source, "output-v2");
+    serverCell.free();
+
+    // But can the server see what the client knows? Without the reply,
+    // the server can't advance. Let's check if a full sync recovers.
+    // This simulates what happens after a page reload (reset_sync_state).
+    console.warn(
+      "BUG #1067 REPRODUCED: generate_sync_message() returned undefined " +
+        "after dropped message. Protocol stalled. Testing reset recovery...",
+    );
+
+    // Reset sync state (simulates page reload)
+    client.reset_sync_state();
+    syncHandles(server, client);
+
+    const recoveredCell = server.get_cell("cell-1");
+    assertExists(recoveredCell);
+    assertEquals(recoveredCell.source, "output-v2");
+    recoveredCell.free();
+  } else {
+    // Protocol recovered — deliver the reply and verify convergence.
+    server.receive_sync_message(recoveryReply);
+    syncHandles(server, client);
+
+    const serverCell = server.get_cell("cell-1");
+    assertExists(serverCell);
+    assertEquals(serverCell.source, "output-v2");
+    serverCell.free();
+  }
+
+  server.free();
+  client.free();
+});
+
+Deno.test("Bug #1067: rapid flushSync steals debounced reply", () => {
+  // Simulates the exact interleaving from the bug:
+  //   - Server streams outputs (multiple sync frames)
+  //   - Client calls generate_sync_reply (debounced) — but before it fires,
+  //     flushSync calls generate_sync_message, consuming the pending reply
+  //   - The debounced reply then returns undefined
+
+  const server = new NotebookHandle("rapid-test");
+  server.add_cell(0, "cell-1", "code");
+
+  const client = NotebookHandle.load(server.save());
+  syncHandles(server, client);
+
+  // Server streams multiple rapid changes (simulates IOPub output burst)
+  server.update_source("cell-1", "line 1");
+  const msg1 = server.flush_local_changes();
+  assert(msg1 !== undefined);
+  client.receive_sync_message(msg1);
+
+  server.update_source("cell-1", "line 1\nline 2");
+  const msg2 = server.flush_local_changes();
+  assert(msg2 !== undefined);
+  client.receive_sync_message(msg2);
+
+  server.update_source("cell-1", "line 1\nline 2\nline 3");
+  const msg3 = server.flush_local_changes();
+  assert(msg3 !== undefined);
+  client.receive_sync_message(msg3);
+
+  // At this point, the client has 3 unacknowledged inbound syncs.
+  // A debounced syncReply$ would call generate_sync_reply() here.
+  // But flushSync() fires first (user presses Ctrl+Enter):
+
+  const flushMsg = client.flush_local_changes(); // flushSync steals it
+  // flushMsg is defined — it covers all 3 inbound syncs.
+
+  // Now the debounced syncReply fires:
+  const debouncedReply = client.flush_local_changes(); // generates reply
+
+  // The debounced reply should ideally still work, but if flushMsg
+  // already advanced sync_state, debouncedReply may be undefined.
+  // This demonstrates the consumption race.
+
+  if (flushMsg !== undefined && debouncedReply === undefined) {
+    console.warn(
+      "BUG #1067 CONFIRMED: flushSync consumed the debounced reply. " +
+        "If flushMsg delivery fails, no recovery path exists.",
+    );
+
+    // Simulate flushMsg delivery failure (best-effort catch from PR #1053)
+    // The message is lost. Can the protocol recover?
+
+    // Server makes a new change
+    server.update_source("cell-1", "line 1\nline 2\nline 3\nline 4");
+    const msg4 = server.flush_local_changes();
+    assert(msg4 !== undefined, "server should still produce messages");
+    client.receive_sync_message(msg4);
+
+    // Client tries to reply again
+    const retryReply = client.flush_local_changes();
+
+    if (retryReply === undefined) {
+      console.warn(
+        "STALL CONFIRMED: client cannot generate reply after lost flushSync. " +
+          "Only reset_sync_state() (page reload) recovers.",
+      );
+    } else {
+      // Partial recovery — deliver and check convergence
+      server.receive_sync_message(retryReply);
+      syncHandles(server, client);
+    }
+  }
+
+  // Regardless of the race outcome, verify final state consistency
+  // after a full reset + sync (simulates page reload)
+  client.reset_sync_state();
+  syncHandles(server, client);
+
+  const clientCell = client.get_cell("cell-1");
+  assertExists(clientCell);
+  // Client should have whatever the server's latest source is
+  const serverCell = server.get_cell("cell-1");
+  assertExists(serverCell);
+  assertEquals(clientCell.source, serverCell.source);
+  clientCell.free();
+  serverCell.free();
+
+  server.free();
+  client.free();
+});
+
+// ── Regression tests: #1067 fix verification ─────────────────────────
+
+Deno.test("Fix #1067: receive_frame returns inline sync reply", () => {
+  // After the fix, receive_frame() generates a reply atomically after
+  // applying an AUTOMERGE_SYNC frame. The reply is in FrameEvent.reply.
+  const server = new NotebookHandle("reply-test");
+  server.add_cell(0, "cell-1", "code");
+  server.update_source("cell-1", "hello");
+
+  const client = NotebookHandle.load(server.save());
+  syncHandles(server, client);
+
+  // Server makes a change
+  server.update_source("cell-1", "hello world");
+  const serverMsg = server.flush_local_changes();
+  assert(serverMsg !== undefined, "server should have a sync message");
+
+  // Client receives via receive_frame (with 0x00 type byte prefix)
+  const frameBytes = new Uint8Array(1 + serverMsg.length);
+  frameBytes[0] = 0x00; // AUTOMERGE_SYNC
+  frameBytes.set(serverMsg, 1);
+
+  const events = client.receive_frame(frameBytes);
+  assert(Array.isArray(events), "receive_frame should return an array");
+  assertEquals(events.length, 1);
+
+  const event = events[0];
+  assertEquals(event.type, "sync_applied");
+  assertEquals(event.changed, true);
+
+  // The fix: reply should be present — generated atomically
+  assert(
+    event.reply !== undefined && event.reply !== null,
+    "SyncApplied should include a reply (the core #1067 fix)",
+  );
+
+  // Deliver the reply to the server — should converge
+  server.receive_sync_message(new Uint8Array(event.reply));
+
+  // Verify convergence
+  const serverCell = server.get_cell("cell-1");
+  const clientCell = client.get_cell("cell-1");
+  assertExists(serverCell);
+  assertExists(clientCell);
+  assertEquals(serverCell.source, "hello world");
+  assertEquals(clientCell.source, "hello world");
+  serverCell.free();
+  clientCell.free();
+
+  server.free();
+  client.free();
+});
+
+Deno.test(
+  "Fix #1067: flush_local_changes only fires for local mutations",
+  () => {
+    const server = new NotebookHandle("flush-test");
+    server.add_cell(0, "cell-1", "code");
+
+    const client = NotebookHandle.load(server.save());
+    syncHandles(server, client);
+
+    // No local changes — flush should return undefined
+    assertEquals(
+      client.flush_local_changes(),
+      undefined,
+      "flush_local_changes should return undefined when no local changes exist",
+    );
+
+    // Make a local change
+    client.update_source("cell-1", "edited");
+
+    // Now flush should return bytes
+    const msg = client.flush_local_changes();
+    assert(
+      msg !== undefined,
+      "flush_local_changes should return bytes after local edit",
+    );
+
+    // Calling again without new changes — should return undefined (in_flight)
+    assertEquals(
+      client.flush_local_changes(),
+      undefined,
+      "flush_local_changes should return undefined after already flushing (in_flight)",
+    );
+
+    server.free();
+    client.free();
+  },
+);
+
+Deno.test("Fix #1067: no reply consumption race with new API", () => {
+  // This tests that the old race can't happen with the new API:
+  // receive_frame generates replies inline, so flush_local_changes
+  // can't steal them.
+  const server = new NotebookHandle("no-race-test");
+  server.add_cell(0, "cell-1", "code");
+
+  const client = NotebookHandle.load(server.save());
+  syncHandles(server, client);
+
+  // Server streams rapid changes (simulates IOPub output burst)
+  server.update_source("cell-1", "output-v1");
+  const msg1 = server.flush_local_changes();
+  assert(msg1 !== undefined);
+
+  server.update_source("cell-1", "output-v2");
+  const msg2 = server.flush_local_changes();
+  assert(msg2 !== undefined);
+
+  // Client receives both via receive_frame — replies generated inline
+  const frame1 = new Uint8Array(1 + msg1.length);
+  frame1[0] = 0x00;
+  frame1.set(msg1, 1);
+  const events1 = client.receive_frame(frame1);
+  const reply1 = events1[0]?.reply;
+
+  const frame2 = new Uint8Array(1 + msg2.length);
+  frame2[0] = 0x00;
+  frame2.set(msg2, 1);
+  const events2 = client.receive_frame(frame2);
+  const reply2 = events2[0]?.reply;
+
+  // Now client calls flush_local_changes (simulating flushSync before execute)
+  // This should NOT consume any pending reply — replies were already generated
+  // inline by receive_frame.
+  const flushMsg = client.flush_local_changes();
+  // flushMsg should be undefined — client has no local changes, only received changes
+  assertEquals(
+    flushMsg,
+    undefined,
+    "flush_local_changes should return undefined when client only received (no local edits)",
+  );
+
+  // Deliver whichever replies were generated — protocol should converge
+  if (reply1) server.receive_sync_message(new Uint8Array(reply1));
+  if (reply2) server.receive_sync_message(new Uint8Array(reply2));
+  syncHandles(server, client);
+
+  const clientCell = client.get_cell("cell-1");
+  assertExists(clientCell);
+  assertEquals(clientCell.source, "output-v2");
+  clientCell.free();
+
+  server.free();
+  client.free();
+});
+
+Deno.test("Fix #1067: cancel_last_flush recovers from failed send", () => {
+  // Tests that cancel_last_flush clears in_flight and sent_hashes,
+  // allowing the next flush to include the full change data.
+  const server = new NotebookHandle("cancel-test");
+  server.add_cell(0, "cell-1", "code");
+
+  const client = NotebookHandle.load(server.save());
+  syncHandles(server, client);
+
+  // Client makes a local change
+  client.update_source("cell-1", "local edit");
+
+  // Flush generates a message (advances sync_state)
+  const msg1 = client.flush_local_changes();
+  assert(msg1 !== undefined, "first flush should produce a message");
+
+  // Simulate delivery failure — message is DROPPED
+  // Call cancel_last_flush to roll back sync_state
+  client.cancel_last_flush();
+
+  // Now flush again — should produce a NEW message with the same change data
+  const msg2 = client.flush_local_changes();
+  assert(
+    msg2 !== undefined,
+    "after cancel_last_flush, flush should produce a message (sent_hashes cleared)",
+  );
+
+  // Deliver msg2 to server — should converge
+  server.receive_sync_message(msg2);
+  syncHandles(server, client);
+
+  const serverCell = server.get_cell("cell-1");
+  assertExists(serverCell);
+  assertEquals(serverCell.source, "local edit");
+  serverCell.free();
+
+  server.free();
+  client.free();
+});
+
+Deno.test(
+  "Fix #1067: sent_hashes sticky without cancel (documents danger)",
+  () => {
+    // This test documents the DANGEROUS behavior when cancel_last_flush
+    // is NOT called after a failed send. The sent_hashes set retains
+    // hashes for changes the server never received, causing future
+    // sync messages to filter them out.
+    const server = new NotebookHandle("sticky-test");
+    server.add_cell(0, "cell-1", "code");
+
+    const client = NotebookHandle.load(server.save());
+    syncHandles(server, client);
+
+    // Client makes a local change
+    client.update_source("cell-1", "local edit");
+
+    // Flush generates a message (advances sync_state, adds to sent_hashes)
+    const msg1 = client.flush_local_changes();
+    assert(msg1 !== undefined);
+
+    // Simulate delivery failure — message is DROPPED
+    // DELIBERATELY do NOT call cancel_last_flush
+
+    // Try to flush again — in_flight is true, so this returns undefined
+    const msg2 = client.flush_local_changes();
+    assertEquals(
+      msg2,
+      undefined,
+      "without cancel, in_flight blocks the next flush",
+    );
+
+    // Even after receiving a server frame (which clears in_flight),
+    // the local change data may be filtered by sent_hashes.
+    // Server sends a trivial change to clear in_flight on client.
+    server.update_source("cell-1", "server edit");
+    const serverMsg = server.flush_local_changes();
+    assert(serverMsg !== undefined);
+    client.receive_sync_message(serverMsg);
+
+    // Now try flush again — in_flight was cleared by receive_sync_message
+    const msg3 = client.flush_local_changes();
+    // msg3 might be defined (protocol can partially recover when heads changed)
+    // but the important thing is that without cancel, recovery is unreliable.
+
+    // Verify: reset_sync_state always recovers (the nuclear option)
+    client.reset_sync_state();
+    syncHandles(server, client);
+
+    // After reset, both should converge to the server's version
+    // (client's "local edit" was superseded by "server edit" via CRDT merge)
+    const serverCell = server.get_cell("cell-1");
+    const clientCell = client.get_cell("cell-1");
+    assertExists(serverCell);
+    assertExists(clientCell);
+    assertEquals(clientCell.source, serverCell.source);
+    serverCell.free();
+    clientCell.free();
+
+    server.free();
+    client.free();
+  },
+);
+
+Deno.test(
+  "Fix #1067: rapid receive_frame produces correct reply pattern",
+  () => {
+    // Verifies that rapid inbound frames produce the right pattern of
+    // replies: first frame gets a reply, subsequent frames may or may not
+    // depending on in_flight and heads.
+    const server = new NotebookHandle("rapid-reply-test");
+    server.add_cell(0, "cell-1", "code");
+
+    const client = NotebookHandle.load(server.save());
+    syncHandles(server, client);
+
+    const replies: (Uint8Array | null)[] = [];
+
+    // Server sends 5 rapid changes
+    for (let i = 1; i <= 5; i++) {
+      server.update_source("cell-1", `line ${i}`);
+      const msg = server.flush_local_changes();
+      assert(msg !== undefined, `server msg ${i} should exist`);
+
+      const frame = new Uint8Array(1 + msg.length);
+      frame[0] = 0x00;
+      frame.set(msg, 1);
+
+      const events = client.receive_frame(frame);
+      assert(Array.isArray(events) && events.length === 1);
+      assertEquals(events[0].type, "sync_applied");
+
+      const reply = events[0].reply;
+      replies.push(reply ? new Uint8Array(reply) : null);
+
+      // Deliver reply to server immediately (simulating no batching)
+      if (reply) {
+        server.receive_sync_message(new Uint8Array(reply));
+      }
+    }
+
+    // At least the first reply should be defined
+    assert(replies[0] !== null, "first frame should produce a reply");
+
+    // After all frames delivered, client should have latest content
+    const clientCell = client.get_cell("cell-1");
+    assertExists(clientCell);
+    assertEquals(clientCell.source, "line 5");
+    clientCell.free();
+
+    // Protocol should be converged
+    assertEquals(client.flush_local_changes(), undefined);
+    assertEquals(server.flush_local_changes(), undefined);
+
+    server.free();
+    client.free();
+  },
+);
+
+Deno.test("Fix #1067: concurrent local edit + daemon frame", () => {
+  // Client makes a local edit, then receives a daemon frame before
+  // flushing. The inline reply should include the local changes.
+  const server = new NotebookHandle("concurrent-test");
+  server.add_cell(0, "cell-1", "code");
+  server.add_cell(1, "cell-2", "code");
+
+  const client = NotebookHandle.load(server.save());
+  syncHandles(server, client);
+
+  // Client makes a local edit (not yet flushed)
+  client.update_source("cell-1", "client edit");
+
+  // Server makes a different change
+  server.update_source("cell-2", "server edit");
+  const serverMsg = server.flush_local_changes();
+  assert(serverMsg !== undefined);
+
+  // Client receives the server's change via receive_frame
+  const frame = new Uint8Array(1 + serverMsg.length);
+  frame[0] = 0x00;
+  frame.set(serverMsg, 1);
+  const events = client.receive_frame(frame);
+  const reply = events[0]?.reply;
+
+  // The inline reply should exist and when delivered should bring
+  // the server up to date with the client's local edit
+  assert(reply !== undefined, "reply should include client's local changes");
+  server.receive_sync_message(new Uint8Array(reply));
+
+  // May need another round to fully converge
+  syncHandles(server, client);
+
+  // Both should have both edits
+  const serverCell1 = server.get_cell("cell-1");
+  const serverCell2 = server.get_cell("cell-2");
+  assertExists(serverCell1);
+  assertExists(serverCell2);
+  assertEquals(serverCell1.source, "client edit");
+  assertEquals(serverCell2.source, "server edit");
+  serverCell1.free();
+  serverCell2.free();
 
   server.free();
   client.free();
@@ -412,8 +965,8 @@ Deno.test("Sync: bootstrap from saved bytes preserves all content", () => {
 
   // Sync should converge immediately (no changes needed)
   syncHandles(daemon, wasm);
-  assertEquals(daemon.generate_sync_message(), undefined);
-  assertEquals(wasm.generate_sync_message(), undefined);
+  assertEquals(daemon.flush_local_changes(), undefined);
+  assertEquals(wasm.flush_local_changes(), undefined);
 
   for (const c of cells) c.free();
   daemon.free();
@@ -433,15 +986,15 @@ Deno.test("Sync: load from bytes + incremental sync with changed flag", () => {
   syncHandles(daemon, wasm);
 
   // Verify sync state is converged
-  assertEquals(daemon.generate_sync_message(), undefined);
-  assertEquals(wasm.generate_sync_message(), undefined);
+  assertEquals(daemon.flush_local_changes(), undefined);
+  assertEquals(wasm.flush_local_changes(), undefined);
 
   // Daemon adds new content
   daemon.add_cell(1, "new-cell", "markdown");
   daemon.update_source("new-cell", "# New section");
 
   // Generate sync message from daemon
-  const msg = daemon.generate_sync_message();
+  const msg = daemon.flush_local_changes();
   assertExists(msg, "Daemon should have sync message after mutation");
 
   // WASM receives and should report changed=true
@@ -475,12 +1028,12 @@ Deno.test("Sync: converged peers have no sync messages", () => {
 
   // After convergence, neither should have messages
   assertEquals(
-    daemon.generate_sync_message(),
+    daemon.flush_local_changes(),
     undefined,
     "Daemon has no message when converged",
   );
   assertEquals(
-    wasm.generate_sync_message(),
+    wasm.flush_local_changes(),
     undefined,
     "WASM has no message when converged",
   );
@@ -505,8 +1058,8 @@ Deno.test("Sync: reset_sync_state allows re-sync from scratch", () => {
   syncHandles(daemon, wasm);
 
   // Both converged
-  assertEquals(daemon.generate_sync_message(), undefined);
-  assertEquals(wasm.generate_sync_message(), undefined);
+  assertEquals(daemon.flush_local_changes(), undefined);
+  assertEquals(wasm.flush_local_changes(), undefined);
 
   // Daemon updates the cell
   daemon.update_source("cell-1", "updated");
@@ -515,7 +1068,7 @@ Deno.test("Sync: reset_sync_state allows re-sync from scratch", () => {
   wasm.reset_sync_state();
 
   // After reset, WASM should need to sync again
-  const wasmMsg = wasm.generate_sync_message();
+  const wasmMsg = wasm.flush_local_changes();
   assertExists(
     wasmMsg,
     "After reset_sync_state, WASM should generate sync message",
@@ -666,7 +1219,7 @@ Deno.test("create_empty: incremental sync after bootstrap works", () => {
   daemon.update_source("cell-2", "y = 2");
 
   // Generate sync message and verify change detection
-  const msg = daemon.generate_sync_message();
+  const msg = daemon.flush_local_changes();
   assertExists(msg, "Daemon should have sync message after adding cell");
 
   const changed = wasm.receive_sync_message(msg);
