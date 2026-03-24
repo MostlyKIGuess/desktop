@@ -1105,6 +1105,16 @@ where
                 let mut auto_launch_at = room.auto_launch_at.write().await;
                 *auto_launch_at = Some(std::time::Instant::now());
             }
+            // Write "starting" immediately so clients never see stale "not_started"
+            {
+                let mut sd = room.state_doc.write().await;
+                let mut changed = false;
+                changed |= sd.set_kernel_status("starting");
+                changed |= sd.set_starting_phase("resolving");
+                if changed {
+                    let _ = room.state_changed_tx.send(());
+                }
+            }
             // Spawn auto-launch in background so we don't block sync
             let room_clone = room.clone();
             let notebook_id_clone = notebook_id.clone();
@@ -1924,6 +1934,15 @@ fn is_untitled_notebook(notebook_id: &str) -> bool {
     uuid::Uuid::parse_str(notebook_id).is_ok()
 }
 
+/// Reset runtime state to "not_started" (clears any stale starting phase).
+/// Used when an early exit prevents kernel launch after status was set to "starting".
+async fn reset_starting_state(room: &NotebookRoom) {
+    let mut sd = room.state_doc.write().await;
+    if sd.set_kernel_status("not_started") {
+        let _ = room.state_changed_tx.send(());
+    }
+}
+
 /// Auto-launch kernel for a trusted notebook when first peer connects.
 /// This is similar to handle_notebook_request(LaunchKernel) but without a request/response.
 ///
@@ -1940,6 +1959,7 @@ async fn auto_launch_kernel(
     // before we finish launching)
     if room.active_peers.load(std::sync::atomic::Ordering::Relaxed) == 0 {
         debug!("[notebook-sync] Auto-launch aborted: no peers remaining");
+        reset_starting_state(room).await;
         return;
     }
 
@@ -1972,6 +1992,7 @@ async fn auto_launch_kernel(
     if let Some(ref kernel) = *kernel_guard {
         if kernel.is_running() {
             debug!("[notebook-sync] Auto-launch skipped: kernel already running");
+            reset_starting_state(room).await;
             return;
         }
     }
@@ -1979,19 +2000,12 @@ async fn auto_launch_kernel(
     // Re-check peers after acquiring lock (another race check)
     if room.active_peers.load(std::sync::atomic::Ordering::Relaxed) == 0 {
         debug!("[notebook-sync] Auto-launch aborted: no peers (after lock)");
+        reset_starting_state(room).await;
         return;
     }
 
     // Clear any stale comm state from a previous kernel (in case it crashed)
     room.comm_state.clear().await;
-
-    // Write "starting" to state_doc before launch begins
-    {
-        let mut sd = room.state_doc.write().await;
-        if sd.set_kernel_status("starting") {
-            let _ = room.state_changed_tx.send(());
-        }
-    }
 
     // Create new kernel
     let mut kernel = RoomKernel::new(
@@ -2116,7 +2130,10 @@ async fn auto_launch_kernel(
             } else {
                 match acquire_pool_env_for_source(&env_source, &daemon, room).await {
                     Some(env) => env,
-                    None => return, // Error already broadcast
+                    None => {
+                        reset_starting_state(room).await;
+                        return;
+                    }
                 }
             };
             ("python", env_source, pooled_env)
@@ -2171,7 +2188,10 @@ async fn auto_launch_kernel(
                 } else {
                     match acquire_pool_env_for_source(&env_source, &daemon, room).await {
                         Some(env) => env,
-                        None => return, // Error already broadcast
+                        None => {
+                            reset_starting_state(room).await;
+                            return;
+                        }
                     }
                 };
                 ("python", env_source, pooled_env)
@@ -2189,11 +2209,22 @@ async fn auto_launch_kernel(
             };
             let pooled_env = match acquire_pool_env_for_source(prewarmed, &daemon, room).await {
                 Some(env) => env,
-                None => return,
+                None => {
+                    reset_starting_state(room).await;
+                    return;
+                }
             };
             ("python", prewarmed.to_string(), pooled_env)
         }
     };
+
+    // Transition to "preparing_env" phase now that runtime/env has been resolved
+    {
+        let mut sd = room.state_doc.write().await;
+        if sd.set_starting_phase("preparing_env") {
+            let _ = room.state_changed_tx.send(());
+        }
+    }
 
     // For inline deps, prepare a cached environment with rich progress
     let progress_handler: std::sync::Arc<dyn kernel_env::ProgressHandler> = std::sync::Arc::new(
@@ -2230,6 +2261,7 @@ async fn auto_launch_kernel(
                             status: format!("error: Failed to prepare environment: {}", e),
                             cell_id: None,
                         });
+                    reset_starting_state(room).await;
                     return;
                 }
             }
@@ -2272,6 +2304,7 @@ async fn auto_launch_kernel(
                             status: format!("error: Failed to prepare environment: {}", e),
                             cell_id: None,
                         });
+                    reset_starting_state(room).await;
                     return;
                 }
             }
@@ -2315,6 +2348,7 @@ async fn auto_launch_kernel(
                             status: format!("error: Failed to prepare conda environment: {}", e),
                             cell_id: None,
                         });
+                    reset_starting_state(room).await;
                     return;
                 }
             }
@@ -2336,6 +2370,14 @@ async fn auto_launch_kernel(
         venv_path,
         python_path,
     );
+
+    // Transition to "launching" phase before starting the kernel process
+    {
+        let mut sd = room.state_doc.write().await;
+        if sd.set_starting_phase("launching") {
+            let _ = room.state_changed_tx.send(());
+        }
+    }
 
     match kernel
         .launch(
@@ -2734,9 +2776,14 @@ async fn handle_notebook_request(
             room.comm_state.clear().await;
 
             // Trust is approved if user explicitly launches kernel — update RuntimeStateDoc
+            // Also set "starting" + "resolving" phase immediately
             {
                 let mut sd = room.state_doc.write().await;
-                if sd.set_trust("trusted", false) {
+                let mut changed = false;
+                changed |= sd.set_trust("trusted", false);
+                changed |= sd.set_kernel_status("starting");
+                changed |= sd.set_starting_phase("resolving");
+                if changed {
                     let _ = room.state_changed_tx.send(());
                 }
             }
@@ -2850,6 +2897,14 @@ async fn handle_notebook_request(
                 env_source.clone()
             };
 
+            // Transition to "preparing_env" phase
+            {
+                let mut sd = room.state_doc.write().await;
+                if sd.set_starting_phase("preparing_env") {
+                    let _ = room.state_changed_tx.send(());
+                }
+            }
+
             // Deno kernels don't need pooled environments
             let pooled_env = if resolved_kernel_type == "deno" {
                 info!("[notebook-sync] LaunchKernel: Deno kernel (no pooled env)");
@@ -2866,6 +2921,7 @@ async fn handle_notebook_request(
                             Some(env)
                         }
                         None => {
+                            reset_starting_state(room).await;
                             return NotebookResponse::Error {
                                 error: "UV pool empty - no environment available".to_string(),
                             };
@@ -2880,6 +2936,7 @@ async fn handle_notebook_request(
                             Some(env)
                         }
                         None => {
+                            reset_starting_state(room).await;
                             return NotebookResponse::Error {
                                 error: "Conda pool empty - no environment available".to_string(),
                             };
@@ -2899,6 +2956,7 @@ async fn handle_notebook_request(
                             match daemon.take_conda_env().await {
                                 Some(env) => Some(env),
                                 None => {
+                                    reset_starting_state(room).await;
                                     return NotebookResponse::Error {
                                         error: "Conda pool empty".to_string(),
                                     };
@@ -2909,6 +2967,7 @@ async fn handle_notebook_request(
                             match daemon.take_uv_env().await {
                                 Some(env) => Some(env),
                                 None => {
+                                    reset_starting_state(room).await;
                                     return NotebookResponse::Error {
                                         error: "UV pool empty".to_string(),
                                     };
@@ -2936,6 +2995,7 @@ async fn handle_notebook_request(
                             "[notebook-sync] Invalid PEP 723 metadata in notebook: {}",
                             e
                         );
+                        reset_starting_state(room).await;
                         return NotebookResponse::Error {
                             error: format!("Invalid PEP 723 metadata in notebook: {}", e),
                         };
@@ -2968,12 +3028,14 @@ async fn handle_notebook_request(
                         }
                         Err(e) => {
                             error!("[notebook-sync] Failed to prepare PEP 723 env: {}", e);
+                            reset_starting_state(room).await;
                             return NotebookResponse::Error {
                                 error: format!("Failed to prepare PEP 723 environment: {}", e),
                             };
                         }
                     }
                 } else {
+                    reset_starting_state(room).await;
                     return NotebookResponse::Error {
                         error: "No PEP 723 dependencies found in notebook cells for requested env_source \"uv:pep723\""
                             .to_string(),
@@ -3008,6 +3070,7 @@ async fn handle_notebook_request(
                             (env, Some(deps))
                         }
                         Err(e) => {
+                            reset_starting_state(room).await;
                             return NotebookResponse::Error {
                                 error: format!("Failed to prepare inline environment: {}", e),
                             };
@@ -3046,6 +3109,7 @@ async fn handle_notebook_request(
                             (env, Some(deps))
                         }
                         Err(e) => {
+                            reset_starting_state(room).await;
                             return NotebookResponse::Error {
                                 error: format!("Failed to prepare conda inline environment: {}", e),
                             };
@@ -3069,6 +3133,14 @@ async fn handle_notebook_request(
                 venv_path,
                 python_path,
             );
+
+            // Transition to "launching" phase before starting the kernel process
+            {
+                let mut sd = room.state_doc.write().await;
+                if sd.set_starting_phase("launching") {
+                    let _ = room.state_changed_tx.send(());
+                }
+            }
 
             match kernel
                 .launch(
