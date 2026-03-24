@@ -5866,6 +5866,7 @@ pub(crate) fn spawn_notebook_file_watcher(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
     fn test_sanitize_peer_label_basic() {
@@ -7662,5 +7663,389 @@ mod tests {
             "Post-rekey cell should be persisted; sources: {:?}",
             sources
         );
+    }
+
+    // ── compute_env_sync_diff tests ───────────────────────────────────────
+
+    #[test]
+    fn test_compute_env_sync_diff_in_sync() {
+        let launched = LaunchedEnvConfig {
+            uv_deps: Some(vec!["numpy".to_string(), "pandas".to_string()]),
+            conda_deps: None,
+            conda_channels: None,
+            deno_config: None,
+            venv_path: None,
+            python_path: None,
+            launch_id: Some("abc".to_string()),
+        };
+        let snapshot = snapshot_with_uv(vec!["numpy".to_string(), "pandas".to_string()]);
+        assert!(
+            compute_env_sync_diff(&launched, &snapshot).is_none(),
+            "identical deps should be in sync"
+        );
+    }
+
+    #[test]
+    fn test_compute_env_sync_diff_added() {
+        let launched = LaunchedEnvConfig {
+            uv_deps: Some(vec!["numpy".to_string()]),
+            conda_deps: None,
+            conda_channels: None,
+            deno_config: None,
+            venv_path: None,
+            python_path: None,
+            launch_id: None,
+        };
+        let snapshot = snapshot_with_uv(vec!["numpy".to_string(), "requests".to_string()]);
+        let diff = compute_env_sync_diff(&launched, &snapshot).expect("should detect drift");
+        assert_eq!(diff.added, vec!["requests".to_string()]);
+        assert!(diff.removed.is_empty());
+        assert!(!diff.channels_changed);
+    }
+
+    #[test]
+    fn test_compute_env_sync_diff_removed() {
+        let launched = LaunchedEnvConfig {
+            uv_deps: Some(vec!["numpy".to_string(), "pandas".to_string()]),
+            conda_deps: None,
+            conda_channels: None,
+            deno_config: None,
+            venv_path: None,
+            python_path: None,
+            launch_id: None,
+        };
+        let snapshot = snapshot_with_uv(vec!["numpy".to_string()]);
+        let diff = compute_env_sync_diff(&launched, &snapshot).expect("should detect drift");
+        assert!(diff.added.is_empty());
+        assert_eq!(diff.removed, vec!["pandas".to_string()]);
+    }
+
+    #[test]
+    fn test_compute_env_sync_diff_added_and_removed() {
+        let launched = LaunchedEnvConfig {
+            uv_deps: Some(vec!["numpy".to_string(), "old-pkg".to_string()]),
+            conda_deps: None,
+            conda_channels: None,
+            deno_config: None,
+            venv_path: None,
+            python_path: None,
+            launch_id: None,
+        };
+        let snapshot = snapshot_with_uv(vec!["numpy".to_string(), "new-pkg".to_string()]);
+        let diff = compute_env_sync_diff(&launched, &snapshot).expect("should detect drift");
+        assert_eq!(diff.added, vec!["new-pkg".to_string()]);
+        assert_eq!(diff.removed, vec!["old-pkg".to_string()]);
+    }
+
+    #[test]
+    fn test_compute_env_sync_diff_conda_channels_changed() {
+        let launched = LaunchedEnvConfig {
+            uv_deps: None,
+            conda_deps: Some(vec!["scipy".to_string()]),
+            conda_channels: Some(vec!["conda-forge".to_string()]),
+            deno_config: None,
+            venv_path: None,
+            python_path: None,
+            launch_id: None,
+        };
+        // Build a conda snapshot with a different channel
+        let mut snapshot = snapshot_with_conda(vec!["scipy".to_string()]);
+        snapshot.runt.conda.as_mut().unwrap().channels = vec!["defaults".to_string()];
+        let diff =
+            compute_env_sync_diff(&launched, &snapshot).expect("should detect channel drift");
+        assert!(diff.added.is_empty());
+        assert!(diff.removed.is_empty());
+        assert!(diff.channels_changed);
+    }
+
+    #[test]
+    fn test_compute_env_sync_diff_no_tracking() {
+        // Prewarmed kernel: no uv_deps, no conda_deps, no deno_config
+        let launched = LaunchedEnvConfig::default();
+        let snapshot = snapshot_with_uv(vec!["numpy".to_string()]);
+        // When the kernel isn't tracking any deps, diff is None (no drift to report)
+        assert!(compute_env_sync_diff(&launched, &snapshot).is_none());
+    }
+
+    // ── check_and_broadcast_sync_state tests ──────────────────────────────
+
+    #[tokio::test]
+    async fn test_check_and_broadcast_sync_state_no_kernel() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (room, _path) = test_room_with_path(&tmp, "no_kernel.ipynb");
+
+        // Write metadata so the function gets past the metadata check
+        let snapshot = snapshot_with_uv(vec!["numpy".to_string()]);
+        {
+            let mut doc = room.doc.write().await;
+            doc.set_metadata_snapshot(&snapshot).unwrap();
+        }
+
+        // Pre-set RuntimeStateDoc env to dirty so we can verify it's NOT changed
+        {
+            let mut sd = room.state_doc.write().await;
+            sd.set_env_sync(false, &["numpy".to_string()], &[], false, false);
+        }
+
+        // No kernel in the room — should be a no-op
+        check_and_broadcast_sync_state(&room).await;
+
+        // Verify env state was NOT touched (still dirty from pre-set)
+        let sd = room.state_doc.read().await;
+        let state = sd.read_state();
+        assert!(
+            !state.env.in_sync,
+            "env should remain dirty when no kernel is present"
+        );
+        assert_eq!(state.env.added, vec!["numpy".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_check_and_broadcast_sync_state_no_metadata() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (room, _path) = test_room_with_path(&tmp, "no_meta.ipynb");
+
+        // Don't write any metadata to the doc
+
+        // Pre-set RuntimeStateDoc env to dirty
+        {
+            let mut sd = room.state_doc.write().await;
+            sd.set_env_sync(false, &["pandas".to_string()], &[], false, false);
+        }
+
+        // No metadata in doc — should return early
+        check_and_broadcast_sync_state(&room).await;
+
+        // Verify env state was NOT touched
+        let sd = room.state_doc.read().await;
+        let state = sd.read_state();
+        assert!(
+            !state.env.in_sync,
+            "env should remain dirty when no metadata is present"
+        );
+    }
+
+    // ── verify_trust_from_snapshot tests ───────────────────────────────────
+
+    #[test]
+    fn test_verify_trust_from_snapshot_no_deps() {
+        let snapshot = snapshot_empty();
+        let result = verify_trust_from_snapshot(&snapshot);
+        assert_eq!(result.status, runt_trust::TrustStatus::NoDependencies);
+        assert!(!result.pending_launch);
+    }
+
+    #[test]
+    #[serial]
+    fn test_verify_trust_from_snapshot_unsigned_deps() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let key_path = temp_dir.path().join("trust-key");
+        std::env::set_var("RUNT_TRUST_KEY_PATH", key_path.to_str().unwrap());
+
+        let snapshot = snapshot_with_uv(vec!["numpy".to_string()]);
+        let result = verify_trust_from_snapshot(&snapshot);
+        assert_eq!(result.status, runt_trust::TrustStatus::Untrusted);
+        assert!(!result.pending_launch);
+
+        std::env::remove_var("RUNT_TRUST_KEY_PATH");
+    }
+
+    #[test]
+    #[serial]
+    fn test_verify_trust_from_snapshot_signed_trusted() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let key_path = temp_dir.path().join("trust-key");
+        std::env::set_var("RUNT_TRUST_KEY_PATH", key_path.to_str().unwrap());
+
+        let mut snapshot = snapshot_with_uv(vec!["numpy".to_string()]);
+
+        // Build the same HashMap that verify_trust_from_snapshot builds, then sign.
+        let mut metadata = std::collections::HashMap::new();
+        if let Ok(runt_value) = serde_json::to_value(&snapshot.runt) {
+            metadata.insert("runt".to_string(), runt_value);
+        }
+        let signature = runt_trust::sign_notebook_dependencies(&metadata).unwrap();
+        snapshot.runt.trust_signature = Some(signature);
+
+        let result = verify_trust_from_snapshot(&snapshot);
+        assert_eq!(result.status, runt_trust::TrustStatus::Trusted);
+        assert!(!result.pending_launch);
+
+        std::env::remove_var("RUNT_TRUST_KEY_PATH");
+    }
+
+    #[test]
+    #[serial]
+    fn test_verify_trust_from_snapshot_invalid_signature() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let key_path = temp_dir.path().join("trust-key");
+        std::env::set_var("RUNT_TRUST_KEY_PATH", key_path.to_str().unwrap());
+
+        let mut snapshot = snapshot_with_uv(vec!["numpy".to_string()]);
+        // Set a bogus signature that won't match.
+        snapshot.runt.trust_signature = Some("bad-signature-value".to_string());
+
+        let result = verify_trust_from_snapshot(&snapshot);
+        assert_eq!(result.status, runt_trust::TrustStatus::SignatureInvalid);
+        assert!(!result.pending_launch);
+
+        std::env::remove_var("RUNT_TRUST_KEY_PATH");
+    }
+
+    #[test]
+    #[serial]
+    fn test_verify_trust_from_snapshot_conda_trusted() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let key_path = temp_dir.path().join("trust-key");
+        std::env::set_var("RUNT_TRUST_KEY_PATH", key_path.to_str().unwrap());
+
+        let mut snapshot = snapshot_with_conda(vec!["pandas".to_string()]);
+
+        // Build the same HashMap that verify_trust_from_snapshot builds, then sign.
+        let mut metadata = std::collections::HashMap::new();
+        if let Ok(runt_value) = serde_json::to_value(&snapshot.runt) {
+            metadata.insert("runt".to_string(), runt_value);
+        }
+        let signature = runt_trust::sign_notebook_dependencies(&metadata).unwrap();
+        snapshot.runt.trust_signature = Some(signature);
+
+        let result = verify_trust_from_snapshot(&snapshot);
+        assert_eq!(result.status, runt_trust::TrustStatus::Trusted);
+        assert!(!result.pending_launch);
+
+        std::env::remove_var("RUNT_TRUST_KEY_PATH");
+    }
+
+    #[tokio::test]
+    async fn test_check_and_update_trust_state_empty_doc() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (room, _path) = test_room_with_path(&tmp, "empty_doc.ipynb");
+
+        // Doc has no metadata written — should not crash.
+        check_and_update_trust_state(&room).await;
+
+        // trust_state should remain Untrusted (the default from test_room_with_path).
+        let ts = room.trust_state.read().await;
+        assert_eq!(ts.status, runt_trust::TrustStatus::Untrusted);
+    }
+
+    #[tokio::test]
+    async fn test_check_and_update_trust_state_no_deps() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (room, _path) = test_room_with_path(&tmp, "no_deps.ipynb");
+
+        // Align RuntimeStateDoc with the room's initial Untrusted state so we
+        // can verify the function actually writes the new value.
+        {
+            let mut sd = room.state_doc.write().await;
+            sd.set_trust("untrusted", true);
+        }
+
+        // Write an empty metadata snapshot (no dependencies).
+        let snapshot = snapshot_empty();
+        {
+            let mut doc = room.doc.write().await;
+            doc.set_metadata_snapshot(&snapshot).unwrap();
+        }
+
+        check_and_update_trust_state(&room).await;
+
+        // Room trust_state should change from Untrusted → NoDependencies.
+        let ts = room.trust_state.read().await;
+        assert_eq!(ts.status, runt_trust::TrustStatus::NoDependencies);
+        drop(ts);
+
+        // RuntimeStateDoc should reflect "no_dependencies" with needs_approval=false.
+        let sd = room.state_doc.read().await;
+        let state = sd.read_state();
+        assert_eq!(state.trust.status, "no_dependencies");
+        assert!(!state.trust.needs_approval);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_check_and_update_trust_state_approval_updates_room() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let key_path = temp_dir.path().join("trust-key");
+        std::env::set_var("RUNT_TRUST_KEY_PATH", key_path.to_str().unwrap());
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (room, _path) = test_room_with_path(&tmp, "signed.ipynb");
+
+        // Align RuntimeStateDoc with the room's initial Untrusted state.
+        {
+            let mut sd = room.state_doc.write().await;
+            sd.set_trust("untrusted", true);
+        }
+
+        // Build a snapshot with UV deps and a valid trust signature.
+        let mut snapshot = snapshot_with_uv(vec!["numpy".to_string()]);
+        let mut metadata = std::collections::HashMap::new();
+        if let Ok(runt_value) = serde_json::to_value(&snapshot.runt) {
+            metadata.insert("runt".to_string(), runt_value);
+        }
+        let signature = runt_trust::sign_notebook_dependencies(&metadata).unwrap();
+        snapshot.runt.trust_signature = Some(signature);
+
+        {
+            let mut doc = room.doc.write().await;
+            doc.set_metadata_snapshot(&snapshot).unwrap();
+        }
+
+        check_and_update_trust_state(&room).await;
+
+        // Room trust_state should be Trusted.
+        let ts = room.trust_state.read().await;
+        assert_eq!(ts.status, runt_trust::TrustStatus::Trusted);
+        drop(ts);
+
+        // RuntimeStateDoc should have "trusted" with needs_approval=false.
+        let sd = room.state_doc.read().await;
+        let state = sd.read_state();
+        assert_eq!(state.trust.status, "trusted");
+        assert!(!state.trust.needs_approval);
+
+        std::env::remove_var("RUNT_TRUST_KEY_PATH");
+    }
+
+    #[tokio::test]
+    async fn test_check_and_update_trust_state_idempotent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (room, _path) = test_room_with_path(&tmp, "idempotent.ipynb");
+
+        // Align RuntimeStateDoc with the room's initial Untrusted state so the
+        // first transition to NoDependencies actually mutates the doc and fires
+        // a notification.
+        {
+            let mut sd = room.state_doc.write().await;
+            sd.set_trust("untrusted", true);
+        }
+
+        // Write an empty metadata snapshot to trigger Untrusted → NoDependencies.
+        let snapshot = snapshot_empty();
+        {
+            let mut doc = room.doc.write().await;
+            doc.set_metadata_snapshot(&snapshot).unwrap();
+        }
+
+        // Subscribe before either call so we capture all notifications.
+        let mut rx = room.state_changed_tx.subscribe();
+
+        // First call: state changes from Untrusted → NoDependencies → notification sent.
+        check_and_update_trust_state(&room).await;
+
+        // Second call: state is already NoDependencies → no change, no notification.
+        check_and_update_trust_state(&room).await;
+
+        // Drain the channel and count how many notifications arrived.
+        let mut count = 0usize;
+        while rx.try_recv().is_ok() {
+            count += 1;
+        }
+        assert_eq!(count, 1, "expected exactly one state_changed notification");
+
+        // Final trust_state should be NoDependencies.
+        let ts = room.trust_state.read().await;
+        assert_eq!(ts.status, runt_trust::TrustStatus::NoDependencies);
     }
 }
