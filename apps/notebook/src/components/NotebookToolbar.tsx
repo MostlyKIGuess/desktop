@@ -105,9 +105,6 @@ export function NotebookToolbar({
     kernelStatus === KERNEL_STATUS.BUSY ||
     kernelStatus === KERNEL_STATUS.STARTING;
   const kernelStatusText = getKernelStatusLabel(kernelStatus, startingPhase);
-  const isKernelNotStarted =
-    kernelStatus === KERNEL_STATUS.NOT_STARTED ||
-    kernelStatus === KERNEL_STATUS.SHUTDOWN;
   const envErrorMessage = envProgress?.error ?? null;
   const envStatusText = envProgress?.statusText ?? kernelStatusText;
   const kernelStatusDescription = envProgress?.isActive
@@ -324,7 +321,10 @@ export function NotebookToolbar({
               kernelStatus === KERNEL_STATUS.BUSY && "bg-amber-500",
               kernelStatus === KERNEL_STATUS.STARTING &&
                 "bg-blue-500 animate-pulse",
-              isKernelNotStarted && "bg-gray-400 dark:bg-gray-500",
+              kernelStatus === KERNEL_STATUS.NOT_STARTED &&
+                "bg-blue-500 animate-pulse",
+              kernelStatus === KERNEL_STATUS.SHUTDOWN &&
+                "bg-gray-400 dark:bg-gray-500",
               (kernelStatus === KERNEL_STATUS.ERROR || envErrorMessage) &&
                 "bg-red-500",
             )}
