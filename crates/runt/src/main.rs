@@ -1480,14 +1480,14 @@ async fn daemon_command(command: DaemonCommands) -> Result<()> {
             } else {
                 None
             };
-            let is_dev = runtimed::is_dev_mode();
+            let is_dev = runt_workspace::is_dev_mode();
 
             // Get socket path from daemon info or default
             let socket_path = daemon_info
                 .as_ref()
                 .map(|i| i.endpoint.clone())
                 .unwrap_or_else(|| {
-                    runtimed::default_socket_path()
+                    runt_workspace::default_socket_path()
                         .to_string_lossy()
                         .to_string()
                 });
@@ -1855,7 +1855,7 @@ async fn doctor_command(
     ) -> DoctorReport {
         // Get expected paths - use service.rs paths for consistency
         let binary_path = runtimed::service::default_binary_path();
-        let socket_path = runtimed::default_socket_path();
+        let socket_path = runt_workspace::default_socket_path();
         let daemon_json_path = runtimed::singleton::daemon_info_path();
         let service_config_path = runtimed::service::service_config_path();
 
@@ -2275,7 +2275,7 @@ async fn doctor_command(
 
     // Get paths for fix operations
     let binary_path = runtimed::service::default_binary_path();
-    let socket_path = runtimed::default_socket_path();
+    let socket_path = runt_workspace::default_socket_path();
     let daemon_json_path = runtimed::singleton::daemon_info_path();
     let service_config_path = runtimed::service::service_config_path();
 
@@ -2927,7 +2927,7 @@ async fn diagnostics_command(output_dir: Option<PathBuf>) -> Result<()> {
     }
 
     // 2. Notebook log
-    let notebook_log = runtimed::default_notebook_log_path();
+    let notebook_log = runt_workspace::default_notebook_log_path();
     if notebook_log.exists() {
         tar.append_path_with_name(&notebook_log, "notebook.log")?;
         println!("  {} notebook.log", "✓".green());
@@ -4028,7 +4028,7 @@ fn find_latest_snapshot(snapshots_dir: &std::path::Path, stem: &str) -> Option<s
 }
 
 /// Export a NotebookDoc to .ipynb JSON.
-fn doc_to_ipynb(doc: &runtimed::notebook_doc::NotebookDoc) -> serde_json::Value {
+fn doc_to_ipynb(doc: &notebook_doc::NotebookDoc) -> serde_json::Value {
     let cells = doc.get_cells();
     let metadata_snapshot = doc.get_metadata_snapshot();
 
@@ -4133,7 +4133,7 @@ fn recover_notebook(
     output: Option<&std::path::Path>,
     list: bool,
 ) -> Result<()> {
-    use runtimed::notebook_doc::{notebook_doc_filename, NotebookDoc};
+    use notebook_doc::{notebook_doc_filename, NotebookDoc};
 
     if list {
         let dirs = all_notebook_docs_dirs();
@@ -4384,7 +4384,7 @@ mod tests {
 
     #[test]
     fn test_find_automerge_file_live_doc() {
-        use runtimed::notebook_doc::NotebookDoc;
+        use notebook_doc::NotebookDoc;
 
         let tmp = tempfile::tempdir().unwrap();
         let docs_dir = tmp.path().to_path_buf();
@@ -4403,7 +4403,7 @@ mod tests {
 
     #[test]
     fn test_find_automerge_file_snapshot_fallback() {
-        use runtimed::notebook_doc::NotebookDoc;
+        use notebook_doc::NotebookDoc;
 
         let tmp = tempfile::tempdir().unwrap();
         let docs_dir = tmp.path().to_path_buf();
@@ -4457,7 +4457,7 @@ mod tests {
 
     #[test]
     fn test_notebook_doc_filename_deterministic() {
-        use runtimed::notebook_doc::notebook_doc_filename;
+        use notebook_doc::notebook_doc_filename;
 
         let path = "/Users/test/notebook.ipynb";
         let a = notebook_doc_filename(path);
@@ -4474,7 +4474,7 @@ mod tests {
 
     #[test]
     fn test_doc_to_ipynb_basic() {
-        use runtimed::notebook_doc::NotebookDoc;
+        use notebook_doc::NotebookDoc;
 
         let mut doc = NotebookDoc::new("test");
         doc.add_cell(0, "cell-1", "code").unwrap();
@@ -4513,7 +4513,7 @@ mod tests {
 
     #[test]
     fn test_doc_to_ipynb_multiline_source() {
-        use runtimed::notebook_doc::NotebookDoc;
+        use notebook_doc::NotebookDoc;
 
         let mut doc = NotebookDoc::new("test");
         doc.add_cell(0, "cell-1", "code").unwrap();
@@ -4531,7 +4531,7 @@ mod tests {
 
     #[test]
     fn test_doc_to_ipynb_empty_source() {
-        use runtimed::notebook_doc::NotebookDoc;
+        use notebook_doc::NotebookDoc;
 
         let mut doc = NotebookDoc::new("test");
         doc.add_cell(0, "cell-1", "code").unwrap();
