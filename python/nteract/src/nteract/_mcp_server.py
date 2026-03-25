@@ -324,13 +324,13 @@ def _build_cell_status_map(queue_state: QueueState) -> dict[str, str]:
 
 
 async def _get_cell_status_map(notebook: runtimed.Notebook) -> dict[str, str]:
-    """Fetch queue state and return cell status map, empty on failure.
+    """Fetch queue state from daemon and return cell status map, empty on failure.
 
-    Status is a best-effort annotation — errors should never prevent
-    get_all_cells or get_cell from returning results.
+    Queries the daemon directly (not the local CRDT) so status is
+    authoritative even right after execute_cell().
     """
     try:
-        queue_state = await notebook.queue_state()
+        queue_state = await notebook._session.get_queue_state()
         return _build_cell_status_map(queue_state)
     except asyncio.CancelledError:
         raise
@@ -339,9 +339,9 @@ async def _get_cell_status_map(notebook: runtimed.Notebook) -> dict[str, str]:
 
 
 async def _get_single_cell_status(notebook: runtimed.Notebook, cell_id: str) -> str | None:
-    """Fetch queue status for a single cell, None on failure."""
+    """Fetch queue status for a single cell from daemon, None on failure."""
     try:
-        queue_state = await notebook.queue_state()
+        queue_state = await notebook._session.get_queue_state()
         if queue_state.executing and queue_state.executing.cell_id == cell_id:
             return "running"
         if any(entry.cell_id == cell_id for entry in queue_state.queued):
@@ -1488,7 +1488,7 @@ class NteractServer:
                 return json.dumps(
                     {
                         "notebook_id": srv._notebook.notebook_id,
-                        "connected": await srv._notebook.is_connected(),
+                        "connected": srv._notebook.is_connected,
                         "runtime_status": srv._notebook.runtime.kernel.status,
                         "env_source": srv._notebook.runtime.kernel.env_source,
                     }
