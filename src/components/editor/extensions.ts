@@ -46,6 +46,7 @@ export const notebookEditorTheme = EditorView.theme({
   // (CodeMirror's base theme adds "padding: 0 2px 0 6px" to .cm-line)
   ".cm-line": {
     paddingLeft: "0",
+    caretColor: "var(--foreground)",   // Ensure cursor is visible even when not focused
   },
   // Mobile-friendly padding
   "@media (max-width: 640px)": {
@@ -61,10 +62,6 @@ export const notebookEditorTheme = EditorView.theme({
   },
   ".cm-focused .cm-cursor": {
     borderLeftColor: "var(--foreground)",
-  },
-  // Ensure cursor is visible even when not focused
-  ".cm-content": {
-    caretColor: "var(--foreground)",
   },
 });
 
