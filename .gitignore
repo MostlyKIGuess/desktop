@@ -97,3 +97,7 @@ crates/notebook/icons/icon.icns
 apps/notebook/package-lock.json
 deno.lock
 uv.lock
+
+.direnv
+result
+.cargo
