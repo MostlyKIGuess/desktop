@@ -54,8 +54,17 @@ export const notebookEditorTheme = EditorView.theme({
     },
   },
   // Slightly thicker cursor for better visibility
+  // Explicit colors for both light and dark themes - GitHub themes don't always set these
   ".cm-cursor": {
     borderLeftWidth: "2px",
+    borderLeftColor: "var(--foreground)",
+  },
+  ".cm-focused .cm-cursor": {
+    borderLeftColor: "var(--foreground)",
+  },
+  // Ensure cursor is visible even when not focused
+  ".cm-content": {
+    caretColor: "var(--foreground)",
   },
 });
 
