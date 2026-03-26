@@ -677,6 +677,11 @@ pub struct NotebookRoom {
     /// Timestamp (ms since epoch) of last self-write to the .ipynb file.
     /// Used to skip file watcher events triggered by our own saves.
     pub last_self_write: Arc<AtomicU64>,
+    /// Automerge heads at the time of the last save to disk.
+    /// The file watcher uses `fork_at(last_save_heads)` so that external
+    /// disk changes merge cleanly with post-save CRDT changes (e.g.,
+    /// background formatting that completed after the save).
+    pub last_save_heads: Arc<RwLock<Vec<automerge::ChangeHash>>>,
     /// Shutdown signal for the file watcher task.
     /// Wrapped in Mutex to allow setting after Arc creation.
     /// Sent when the room is evicted to stop the watcher.
@@ -842,6 +847,7 @@ impl NotebookRoom {
             comm_state: Arc::new(CommState::new()),
             is_loading: AtomicBool::new(false),
             last_self_write: Arc::new(AtomicU64::new(0)),
+            last_save_heads: Arc::new(RwLock::new(Vec::new())),
             watcher_shutdown_tx: Mutex::new(None),
             state_doc,
             state_changed_tx,
@@ -903,6 +909,7 @@ impl NotebookRoom {
             comm_state: Arc::new(CommState::new()),
             is_loading: AtomicBool::new(false),
             last_self_write: Arc::new(AtomicU64::new(0)),
+            last_save_heads: Arc::new(RwLock::new(Vec::new())),
             watcher_shutdown_tx: Mutex::new(None),
             state_doc,
             state_changed_tx,
@@ -1338,7 +1345,7 @@ fn sanitize_peer_label(raw: Option<&str>, fallback: &str) -> String {
 async fn run_sync_loop_v2<R, W>(
     reader: &mut R,
     writer: &mut W,
-    room: &NotebookRoom,
+    room: &Arc<NotebookRoom>,
     rooms: NotebookRooms,
     mut notebook_id: String,
     daemon: std::sync::Arc<crate::daemon::Daemon>,
@@ -2774,7 +2781,7 @@ async fn rekey_ephemeral_room(
 
 /// Handle a NotebookRequest and return a NotebookResponse.
 async fn handle_notebook_request(
-    room: &NotebookRoom,
+    room: &Arc<NotebookRoom>,
     request: NotebookRequest,
     daemon: std::sync::Arc<crate::daemon::Daemon>,
 ) -> NotebookResponse {
@@ -3482,27 +3489,13 @@ async fn handle_notebook_request(
                 };
             }
 
-            // Format before execution (best-effort, non-blocking on failure)
-            let source = if let Some(runtime) = detect_room_runtime(room).await {
-                if let Some(formatted) = format_source(&source, &runtime).await {
-                    // Write formatted source back to the Automerge doc
-                    let mut doc = room.doc.write().await;
-                    if doc.update_source(&cell_id, &formatted).is_ok() {
-                        let _ = room.changed_tx.send(());
-                        debug!("[format] Formatted cell {} before execution", cell_id);
-                    }
-                    formatted
-                } else {
-                    source
-                }
-            } else {
-                source
-            };
-
-            // NOW lock kernel for the queue operation
+            // Queue the user's source immediately — no formatter delay.
+            // Formatting is applied afterward via fork+merge (see below).
+            // This is safe because ruff/deno fmt are semantic no-ops:
+            // the formatted code produces identical outputs.
             let mut kernel_guard = room.kernel.lock().await;
             if let Some(ref mut kernel) = *kernel_guard {
-                match kernel.queue_cell(cell_id.clone(), source).await {
+                match kernel.queue_cell(cell_id.clone(), source.clone()).await {
                     Ok(execution_id) => {
                         // Clear outputs and stamp execution_id at queue time
                         // so clients see immediate feedback via CRDT sync.
@@ -3513,6 +3506,36 @@ async fn handle_notebook_request(
                             let _ = doc.set_execution_id(&cell_id, Some(&execution_id));
                             let _ = room.changed_tx.send(());
                         }
+
+                        // Best-effort background formatting via fork+merge.
+                        // Fork the doc NOW (before the formatter runs) so
+                        // update_source on the fork diffs against the original
+                        // text. When merged back, Automerge treats formatting
+                        // ops as concurrent with any user edits that arrived
+                        // on the live doc while the formatter was running.
+                        let fork = {
+                            let mut doc = room.doc.write().await;
+                            doc.fork()
+                        };
+                        let room_clone = Arc::clone(room);
+                        let cell_id_clone = cell_id.clone();
+                        tokio::spawn(async move {
+                            if let Some(runtime) = detect_room_runtime(&room_clone).await {
+                                if let Some(formatted) = format_source(&source, &runtime).await {
+                                    let mut fork = fork;
+                                    if fork.update_source(&cell_id_clone, &formatted).is_ok() {
+                                        let mut doc = room_clone.doc.write().await;
+                                        let _ = doc.merge(&mut fork);
+                                        let _ = room_clone.changed_tx.send(());
+                                        debug!(
+                                            "[format] Formatted cell {} after queuing",
+                                            cell_id_clone
+                                        );
+                                    }
+                                }
+                            }
+                        });
+
                         NotebookResponse::CellQueued {
                             cell_id,
                             execution_id,
@@ -3663,9 +3686,10 @@ async fn handle_notebook_request(
                     doc.get_cells()
                 }; // release read lock before writing
 
-                // Queue all code cells in document order, clearing outputs
-                // up front so clients see all cells go blank immediately.
+                // Queue all code cells immediately with original source —
+                // no formatter delay. See ExecuteCell comment for rationale.
                 let mut queued = Vec::new();
+                let mut cell_sources: Vec<(String, String)> = Vec::new();
                 for cell in cells {
                     if cell.cell_type == "code" {
                         match kernel
@@ -3673,6 +3697,7 @@ async fn handle_notebook_request(
                             .await
                         {
                             Ok(execution_id) => {
+                                cell_sources.push((cell.id.clone(), cell.source.clone()));
                                 queued.push(QueueEntry {
                                     cell_id: cell.id.clone(),
                                     execution_id,
@@ -3698,6 +3723,33 @@ async fn handle_notebook_request(
                     }
                     let _ = room.changed_tx.send(());
                 }
+
+                // Best-effort background formatting via fork+merge.
+                // Fork NOW so the baseline is the pre-format doc state.
+                let fork = {
+                    let mut doc = room.doc.write().await;
+                    doc.fork()
+                };
+                let room_clone = Arc::clone(room);
+                tokio::spawn(async move {
+                    if let Some(runtime) = detect_room_runtime(&room_clone).await {
+                        let mut fork = fork;
+                        let mut any_formatted = false;
+                        for (cell_id, source) in &cell_sources {
+                            if let Some(fmt) = format_source(source, &runtime).await {
+                                if fork.update_source(cell_id, &fmt).is_ok() {
+                                    any_formatted = true;
+                                }
+                            }
+                        }
+                        if any_formatted {
+                            let mut doc = room_clone.doc.write().await;
+                            let _ = doc.merge(&mut fork);
+                            let _ = room_clone.changed_tx.send(());
+                            debug!("[format] Formatted cells after run-all queuing");
+                        }
+                    }
+                });
 
                 NotebookResponse::AllCellsQueued { queued }
             } else {
@@ -4189,19 +4241,26 @@ async fn format_notebook_cells(room: &NotebookRoom) -> Result<usize, String> {
         return Ok(0);
     }
 
-    let mut formatted_count = 0;
+    // Fork BEFORE formatting so the baseline is the pre-format doc state.
+    // Formatting ops on the fork are concurrent with any user edits on the
+    // live doc, and Automerge's text CRDT merges them cleanly.
+    let mut fork = {
+        let mut doc = room.doc.write().await;
+        doc.fork()
+    };
 
+    let mut formatted_count = 0;
     for (cell_id, source) in cells {
-        if let Some(formatted) = format_source(&source, &runtime).await {
-            let mut doc = room.doc.write().await;
-            if doc.update_source(&cell_id, &formatted).is_ok() {
+        if let Some(fmt) = format_source(&source, &runtime).await {
+            if fork.update_source(&cell_id, &fmt).is_ok() {
                 formatted_count += 1;
             }
         }
     }
 
-    // Broadcast changes to connected peers if any cells were formatted
     if formatted_count > 0 {
+        let mut doc = room.doc.write().await;
+        let _ = doc.merge(&mut fork);
         let _ = room.changed_tx.send(());
         info!(
             "[format] Formatted {} code cells (runtime: {})",
@@ -4408,6 +4467,15 @@ async fn save_notebook_to_disk(
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
     room.last_self_write.store(now, Ordering::Relaxed);
+
+    // Record the doc heads at save time so the file watcher can fork_at
+    // this point, treating disk changes as concurrent with post-save
+    // CRDT mutations (e.g., background formatting).
+    {
+        let mut doc = room.doc.write().await;
+        let heads = doc.get_heads();
+        *room.last_save_heads.write().await = heads;
+    }
 
     info!(
         "[notebook-sync] Saved notebook to disk: {:?} ({} cells)",
@@ -5764,13 +5832,27 @@ async fn apply_ipynb_changes(
         }
     }
 
+    // For source updates on existing cells, use fork_at(last_save_heads)
+    // + merge so that external edits compose with post-save CRDT changes
+    // (e.g., background formatting) rather than overwriting them.
+    let save_heads = room.last_save_heads.read().await.clone();
+    let mut source_fork = if !save_heads.is_empty() {
+        doc.fork_at(&save_heads).ok()
+    } else {
+        None
+    };
+
     // Process external cells in order (add new or update existing)
     for (index, ext_cell) in external_cells.iter().enumerate() {
         if let Some(current_cell) = current_map.get(ext_cell.id.as_str()) {
             // Cell exists - check if source changed
             if current_cell.source != ext_cell.source {
                 debug!("[notebook-watch] Updating source for cell: {}", ext_cell.id);
-                if let Ok(true) = doc.update_source(&ext_cell.id, &ext_cell.source) {
+                if let Some(ref mut fork) = source_fork {
+                    // Apply on fork at save point, merge later
+                    let _ = fork.update_source(&ext_cell.id, &ext_cell.source);
+                    changed = true;
+                } else if let Ok(true) = doc.update_source(&ext_cell.id, &ext_cell.source) {
                     changed = true;
                 }
             }
@@ -5848,6 +5930,12 @@ async fn apply_ipynb_changes(
                 let _ = doc.set_cell_resolved_assets(&ext_cell.id, ext_assets);
             }
         }
+    }
+
+    // Merge source fork back — source changes from disk compose with
+    // post-save CRDT changes via Automerge's text CRDT merge.
+    if let Some(ref mut fork) = source_fork {
+        let _ = doc.merge(fork);
     }
 
     changed
@@ -6490,6 +6578,7 @@ mod tests {
             comm_state: Arc::new(crate::comm_state::CommState::new()),
             is_loading: AtomicBool::new(false),
             last_self_write: Arc::new(AtomicU64::new(0)),
+            last_save_heads: Arc::new(RwLock::new(Vec::new())),
             watcher_shutdown_tx: Mutex::new(None),
             state_doc,
             state_changed_tx,
