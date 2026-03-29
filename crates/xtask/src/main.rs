@@ -72,6 +72,18 @@ fn main() {
             cmd_integration(filter);
         }
         "wasm" => cmd_wasm(),
+        "mcpb" => {
+            let output = args
+                .windows(2)
+                .find(|w| w[0] == "--output")
+                .map(|w| w[1].as_str());
+            let variant = args
+                .windows(2)
+                .find(|w| w[0] == "--variant")
+                .map(|w| w[1].as_str())
+                .unwrap_or("stable");
+            cmd_mcpb(output, variant);
+        }
         "--help" | "-h" | "help" => print_help(),
         cmd => {
             eprintln!("Unknown command: {cmd}");
@@ -124,6 +136,9 @@ Testing:
 Other:
   wasm                       Rebuild runtimed-wasm (wasm-pack build)
   icons [source.png]         Generate icon variants
+  mcpb                       Package nteract as a Claude Desktop extension (.mcpb)
+  mcpb --variant nightly     Build nightly variant (different name/icon)
+  mcpb --output <path>       Write the .mcpb archive to a custom path
   help                       Show this help
 "
     );
@@ -1988,6 +2003,204 @@ fn exit_on_failed_status(label: &str, status: ExitStatus) {
         eprintln!("{label} exited with status {status}");
         exit(status.code().unwrap_or(1));
     }
+}
+
+/// Package nteract as a Claude Desktop extension (.mcpb ZIP archive).
+///
+/// The bundle contains:
+///   manifest.json   — metadata and server entry point
+///   icon.png        — 512×512 light-theme icon
+///   icon-dark.png   — 512×512 dark-theme icon
+///
+/// The server is NOT bundled as a binary. Instead the manifest instructs
+/// Claude Desktop to invoke `uvx nteract` — the nteract MCP server is
+/// distributed as a Python package on PyPI and fetched on first use.
+///
+/// Manifest templates live in `mcpb/manifest.{variant}.json`. The only
+/// substitution is `{{VERSION}}` → the `runtimed` crate version.
+fn cmd_mcpb(output: Option<&str>, variant: &str) {
+    let version = read_package_version("runtimed");
+
+    // ── 1. Read and populate the manifest template ──────────────────────────
+    let template_path = format!("mcpb/manifest.{variant}.json");
+    let template = fs::read_to_string(&template_path).unwrap_or_else(|e| {
+        eprintln!("Failed to read {template_path}: {e}");
+        eprintln!("Valid variants: stable, nightly (looked for mcpb/manifest.{{variant}}.json)");
+        exit(1);
+    });
+
+    let manifest_str = template.replace("{{VERSION}}", &version);
+
+    // Parse to validate JSON and re-serialize with consistent formatting.
+    let manifest: serde_json::Value = serde_json::from_str(&manifest_str).unwrap_or_else(|e| {
+        eprintln!("Invalid JSON in {template_path} after substitution: {e}");
+        exit(1);
+    });
+    let manifest_str = serde_json::to_string_pretty(&manifest).unwrap_or_else(|e| {
+        eprintln!("Failed to serialize manifest.json: {e}");
+        exit(1);
+    });
+
+    // ── 2. Create a staging directory ───────────────────────────────────────
+    let staging_dir = std::env::temp_dir().join(format!("nteract-mcpb-{}", std::process::id()));
+    fs::create_dir_all(&staging_dir).unwrap_or_else(|e| {
+        eprintln!("Failed to create staging directory: {e}");
+        exit(1);
+    });
+
+    // ── 3. Copy icons ────────────────────────────────────────────────────────
+    // Stable: light = source.png, dark = source-nightly.png
+    // Nightly: light = source-nightly.png, dark = source.png (swapped)
+    let (light_src, dark_src) = match variant {
+        "nightly" => (
+            "crates/notebook/icons/source-nightly.png",
+            "crates/notebook/icons/source.png",
+        ),
+        _ => (
+            "crates/notebook/icons/source.png",
+            "crates/notebook/icons/source-nightly.png",
+        ),
+    };
+
+    if !Path::new(light_src).exists() {
+        eprintln!("Icon not found: {light_src}");
+        eprintln!("Run `cargo xtask icons` first to generate icons.");
+        let _ = fs::remove_dir_all(&staging_dir);
+        exit(1);
+    }
+
+    // Resize icons to 512x512 — source assets are 1024x1024 but the manifest
+    // declares 512x512 and Claude Desktop may be strict about the match.
+    let resize_icon = |src: &str, dest: &str| {
+        let status = Command::new("sips")
+            .args(["-z", "512", "512", src, "--out", dest])
+            .stdout(Stdio::null())
+            .status()
+            .unwrap_or_else(|e| {
+                eprintln!("Failed to run sips to resize {src}: {e}");
+                exit(1);
+            });
+        if !status.success() {
+            eprintln!("sips failed to resize {src}");
+            exit(1);
+        }
+    };
+
+    let light_dest = staging_dir.join("icon.png");
+    resize_icon(light_src, &light_dest.to_string_lossy());
+
+    // If the dark icon doesn't exist, fall back to the light icon.
+    let dark_actual = if Path::new(dark_src).exists() {
+        dark_src
+    } else {
+        light_src
+    };
+    let dark_dest = staging_dir.join("icon-dark.png");
+    resize_icon(dark_actual, &dark_dest.to_string_lossy());
+
+    // ── 4. Copy server shim ───────────────────────────────────────────────
+    let server_dir = staging_dir.join("server");
+    fs::create_dir_all(&server_dir).unwrap_or_else(|e| {
+        eprintln!("Failed to create server directory: {e}");
+        exit(1);
+    });
+    fs::copy("mcpb/server/main.py", server_dir.join("main.py")).unwrap_or_else(|e| {
+        eprintln!("Failed to copy server/main.py: {e}");
+        exit(1);
+    });
+
+    // ── 5. Write manifest.json ──────────────────────────────────────────────
+    fs::write(staging_dir.join("manifest.json"), &manifest_str).unwrap_or_else(|e| {
+        eprintln!("Failed to write manifest.json: {e}");
+        exit(1);
+    });
+
+    // ── 6. Create ZIP archive ────────────────────────────────────────────────
+    let default_name = if variant == "stable" {
+        "nteract.mcpb"
+    } else {
+        "nteract-nightly.mcpb"
+    };
+    let output_path = output.unwrap_or(default_name);
+
+    // Resolve the output path to an absolute path before changing directories.
+    let abs_output = if Path::new(output_path).is_absolute() {
+        Path::new(output_path).to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|e| {
+                eprintln!("Failed to get current directory: {e}");
+                exit(1);
+            })
+            .join(output_path)
+    };
+
+    // Ensure the parent directory exists so zip can create the output file.
+    if let Some(parent) = abs_output.parent() {
+        fs::create_dir_all(parent).unwrap_or_else(|e| {
+            eprintln!(
+                "Failed to create output directory {}: {e}",
+                parent.display()
+            );
+            exit(1);
+        });
+    }
+
+    // Remove any existing archive so zip doesn't merge old contents.
+    let _ = fs::remove_file(&abs_output);
+
+    println!("Creating archive {}...", abs_output.display());
+
+    let zip_status = Command::new("zip")
+        .args(["-r", &abs_output.to_string_lossy(), "."])
+        .current_dir(&staging_dir)
+        .status()
+        .unwrap_or_else(|e| {
+            eprintln!("Failed to run zip: {e}");
+            eprintln!("zip must be available in PATH.");
+            exit(1);
+        });
+
+    if !zip_status.success() {
+        eprintln!("zip command failed");
+        let _ = fs::remove_dir_all(&staging_dir);
+        exit(1);
+    }
+
+    // ── 7. Cleanup staging dir ───────────────────────────────────────────────
+    let _ = fs::remove_dir_all(&staging_dir);
+
+    println!("Done: {}", abs_output.display());
+}
+
+/// Read the version of a workspace package from `cargo metadata`.
+fn read_package_version(package: &str) -> String {
+    let output = Command::new("cargo")
+        .args(["metadata", "--no-deps", "--format-version", "1"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .unwrap_or_else(|e| {
+            eprintln!("Failed to run cargo metadata: {e}");
+            exit(1);
+        });
+
+    if !output.status.success() {
+        eprintln!("cargo metadata failed");
+        exit(1);
+    }
+
+    let metadata: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|e| {
+        eprintln!("Failed to parse cargo metadata output: {e}");
+        exit(1);
+    });
+
+    metadata["packages"]
+        .as_array()
+        .and_then(|pkgs| pkgs.iter().find(|p| p["name"].as_str() == Some(package)))
+        .and_then(|p| p["version"].as_str())
+        .unwrap_or("0.0.0")
+        .to_string()
 }
 
 #[cfg(test)]
