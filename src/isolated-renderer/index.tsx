@@ -16,6 +16,15 @@ import { createRoot, type Root } from "react-dom/client";
 import "./styles.css";
 
 import type { RenderPayload } from "@/components/isolated/frame-bridge";
+import { JsonRpcTransport } from "@/components/isolated/jsonrpc-transport";
+import {
+  NTERACT_CLEAR_OUTPUTS,
+  NTERACT_RENDER_COMPLETE,
+  NTERACT_RENDER_OUTPUT,
+  NTERACT_RENDERER_READY,
+  NTERACT_RESIZE,
+  NTERACT_THEME,
+} from "@/components/isolated/rpc-methods";
 // Import output components directly (not through MediaRouter's lazy loading)
 // This ensures all components are bundled inline for the isolated iframe
 import {
@@ -91,16 +100,39 @@ function updateDocumentTheme(isDark: boolean) {
 
 // --- Message Handling ---
 
+// Global transport for JSON-RPC communication with host
+let rpcTransport: JsonRpcTransport | null = null;
+
 type MessageHandler = (type: string, payload: unknown) => void;
 
 let messageHandler: MessageHandler | null = null;
 
 function setupMessageListener() {
+  // Create JSON-RPC transport — handles nteract/* methods from the host
+  rpcTransport = new JsonRpcTransport(window.parent, window.parent);
+
+  // Route JSON-RPC notifications to the React message handler
+  rpcTransport.onNotification(NTERACT_RENDER_OUTPUT, (params) => {
+    messageHandler?.("render", params);
+  });
+  rpcTransport.onNotification(NTERACT_CLEAR_OUTPUTS, () => {
+    messageHandler?.("clear", undefined);
+  });
+  rpcTransport.onNotification(NTERACT_THEME, (params) => {
+    messageHandler?.("theme", params);
+  });
+  rpcTransport.start();
+
+  // Legacy listener for any { type, payload } messages that arrive
+  // (e.g., during bootstrap before transport is set up on host side)
   window.addEventListener("message", (event) => {
-    // Only accept messages from parent
     if (event.source !== window.parent) return;
 
-    const { type, payload } = event.data || {};
+    const data = event.data;
+    // Skip JSON-RPC messages — the transport handles them
+    if (data?.jsonrpc === "2.0") return;
+
+    const { type, payload } = data || {};
     if (messageHandler) {
       messageHandler(type, payload);
     }
@@ -180,8 +212,9 @@ function IsolatedRendererApp() {
   useEffect(() => {
     messageHandler = handleMessage;
 
-    // Now that the handler is registered, notify parent that renderer is ready
-    // This ensures messages won't be dropped due to race conditions
+    // Notify parent that renderer is ready — send both formats.
+    // JSON-RPC for the transport, legacy for the fallback handler.
+    rpcTransport?.notify(NTERACT_RENDERER_READY, {});
     window.parent.postMessage({ type: "renderer_ready" }, "*");
 
     return () => {
