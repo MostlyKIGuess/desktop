@@ -24,10 +24,10 @@ jobs:
   update-hashes:
     name: Update Nix hashes
     runs-on: ubuntu-latest
-    # Only auto-commit on push to main, not on PRs
     if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     permissions:
       contents: write
+      pull-requests: write
     steps:
       - uses: actions/checkout@v4
 
@@ -64,25 +64,39 @@ jobs:
         if: steps.check.outputs.hash_ok == 'false'
         run: |
           NEW_HASH="${{ steps.check.outputs.new_hash }}"
-          # Replace the hash line in the pnpmDeps block
           sed -i "s|hash = \"sha256-.*\";|hash = \"$NEW_HASH\";|" flake.nix
           echo "Updated hash to $NEW_HASH"
 
-      - name: Commit updated hash
+      - name: Create or update PR
         if: steps.check.outputs.hash_ok == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          BRANCH="chore/nix-hash-update"
+
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git checkout -B "$BRANCH"
           git add flake.nix
-          git diff --staged --quiet || git commit -m "chore(nix): update pnpmDeps hash"
-          git push
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          git commit -m "chore(nix): update pnpmDeps hash"
+          git push --force origin "$BRANCH"
+
+          # create PR if none exists, otherwise force-push updates it
+          EXISTING=$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number')
+          if [ -z "$EXISTING" ]; then
+            gh pr create \
+              --title "chore(nix): update pnpmDeps hash" \
+              --body "Automated update of the pnpmDeps hash in flake.nix. Triggered because pnpm-lock.yaml changed and the pre-fetched offline store hash is stale." \
+              --head "$BRANCH" \
+              --label "nix"
+          else
+            echo "PR #$EXISTING already exists, branch updated via force-push"
+          fi
 
   check:
     name: Verify Nix build
     runs-on: ubuntu-latest
-    # On PRs, only check!
     if: github.event_name == 'pull_request'
     steps:
       - uses: actions/checkout@v4
