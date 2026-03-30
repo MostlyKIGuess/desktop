@@ -11,9 +11,11 @@ members = [
     "crates/notebook-sync",
     "crates/xtask",
     "crates/runtimed",
+    "crates/runtimed-client",
     "crates/runtimed-py",
     "crates/runtimed-wasm",
     "crates/mcp-supervisor",
+    "crates/runt-mcp",
 ]
 default-members = ["crates/notebook"]
 resolver = "2"

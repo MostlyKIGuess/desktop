@@ -1,0 +1,31 @@
+{
+  "manifest_version": "0.3",
+  "name": "nteract",
+  "display_name": "nteract",
+  "version": "{{VERSION}}",
+  "description": "Create, edit, and run Jupyter notebooks with Claude",
+  "author": {
+    "name": "nteract contributors",
+    "url": "https://nteract.io"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nteract/desktop"
+  },
+  "license": "BSD-3-Clause",
+  "server": {
+    "type": "node",
+    "entry_point": "server/launch.mjs",
+    "mcp_config": {
+      "command": "node",
+      "args": ["server/launch.mjs"],
+      "env": { "NTERACT_CHANNEL": "stable" }
+    }
+  },
+  "icon": "icon.png",
+  "icons": [
+    { "src": "icon.png", "size": "512x512", "theme": "light" },
+    { "src": "icon-dark.png", "size": "512x512", "theme": "dark" }
+  ],
+  "keywords": ["jupyter", "notebook", "python", "data-science"]
+}

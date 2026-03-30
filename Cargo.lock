@@ -1611,6 +1611,17 @@ dependencies = [
 
 [[package]]
 name = "fancy-regex"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6e24cb5a94bcae1e5408b0effca5cd7172ea3c5755049c5f3af4cd283a165298"
+dependencies = [
+ "bit-set",
+ "regex-automata",
+ "regex-syntax",
+]
+
+[[package]]
+name = "fancy-regex"
 version = "0.16.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "998b056554fbe42e03ae0e152895cd1a7e1002aec800fdc6635d20270260c46f"
@@ -2609,6 +2620,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower-service",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -3374,6 +3386,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "lru-slab"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
+
+[[package]]
 name = "mac"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3696,7 +3714,7 @@ dependencies = [
  "rfd 0.17.2",
  "runt-trust",
  "runt-workspace",
- "runtimed",
+ "runtimed-client",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -3753,7 +3771,7 @@ dependencies = [
  "log",
  "notebook-doc",
  "notebook-protocol",
- "runtimed",
+ "runtimed-client",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
@@ -4939,6 +4957,61 @@ dependencies = [
 ]
 
 [[package]]
+name = "quinn"
+version = "0.11.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b9e20a958963c291dc322d98411f541009df2ced7b5a4f2bd52337638cfccf20"
+dependencies = [
+ "bytes",
+ "cfg_aliases",
+ "pin-project-lite",
+ "quinn-proto",
+ "quinn-udp",
+ "rustc-hash",
+ "rustls",
+ "socket2",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "web-time",
+]
+
+[[package]]
+name = "quinn-proto"
+version = "0.11.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "434b42fec591c96ef50e21e886936e66d3cc3f737104fdb9b737c40ffb94c098"
+dependencies = [
+ "bytes",
+ "getrandom 0.3.4",
+ "lru-slab",
+ "rand 0.9.2",
+ "ring",
+ "rustc-hash",
+ "rustls",
+ "rustls-pki-types",
+ "slab",
+ "thiserror 2.0.18",
+ "tinyvec",
+ "tracing",
+ "web-time",
+]
+
+[[package]]
+name = "quinn-udp"
+version = "0.5.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "addec6a0dcad8a8d96a771f815f0eaf55f9d1805756410b39f5fa81332574cbd"
+dependencies = [
+ "cfg_aliases",
+ "libc",
+ "once_cell",
+ "socket2",
+ "tracing",
+ "windows-sys 0.60.2",
+]
+
+[[package]]
 name = "quote"
 version = "1.0.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5164,7 +5237,7 @@ dependencies = [
  "chrono",
  "core-foundation",
  "dirs 6.0.0",
- "fancy-regex",
+ "fancy-regex 0.16.2",
  "file_url",
  "fs-err",
  "glob",
@@ -5619,6 +5692,8 @@ dependencies = [
  "native-tls",
  "percent-encoding",
  "pin-project-lite",
+ "quinn",
+ "rustls",
  "rustls-pki-types",
  "serde",
  "serde_json",
@@ -5626,6 +5701,7 @@ dependencies = [
  "sync_wrapper",
  "tokio",
  "tokio-native-tls",
+ "tokio-rustls",
  "tokio-util",
  "tower",
  "tower-http",
@@ -5635,6 +5711,7 @@ dependencies = [
  "wasm-bindgen-futures",
  "wasm-streams 0.4.2",
  "web-sys",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -5904,9 +5981,11 @@ dependencies = [
  "notebook-doc",
  "notify",
  "petname",
+ "rmcp",
  "rpassword",
+ "runt-mcp",
  "runt-workspace",
- "runtimed",
+ "runtimed-client",
  "runtimelib",
  "serde",
  "serde_json",
@@ -5916,6 +5995,26 @@ dependencies = [
  "tokio",
  "uuid",
  "walkdir",
+]
+
+[[package]]
+name = "runt-mcp"
+version = "0.1.0"
+dependencies = [
+ "fancy-regex 0.14.0",
+ "notebook-doc",
+ "notebook-protocol",
+ "notebook-sync",
+ "regex",
+ "rmcp",
+ "runt-workspace",
+ "runtimed-client",
+ "schemars 1.2.1",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -5988,12 +6087,38 @@ dependencies = [
  "reqwest-middleware",
  "runt-trust",
  "runt-workspace",
+ "runtimed-client",
  "runtimelib",
  "schemars 1.2.1",
  "serde",
  "serde_json",
  "serial_test",
  "sha2 0.10.9",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "ts-rs",
+ "uuid",
+ "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "runtimed-client"
+version = "2.0.4"
+dependencies = [
+ "automerge",
+ "base64 0.22.1",
+ "chrono",
+ "dirs 5.0.1",
+ "libc",
+ "log",
+ "notebook-doc",
+ "notebook-protocol",
+ "reqwest 0.12.28",
+ "runt-workspace",
+ "schemars 1.2.1",
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
@@ -6016,7 +6141,7 @@ dependencies = [
  "pyo3-async-runtimes",
  "reqwest 0.12.28",
  "runt-workspace",
- "runtimed",
+ "runtimed-client",
  "serde_json",
  "thiserror 1.0.69",
  "tokio",
@@ -6139,6 +6264,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "758025cb5fccfd3bc2fd74708fd4682be41d99e5dff73c377c0646c6012c73a4"
 dependencies = [
  "once_cell",
+ "ring",
  "rustls-pki-types",
  "rustls-webpki",
  "subtle",
@@ -6151,6 +6277,7 @@ version = "1.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "be040f8b0a225e40375822a563fa9524378b9d63112f53e19ffff34df5d33fdd"
 dependencies = [
+ "web-time",
  "zeroize",
 ]
 
@@ -8583,6 +8710,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "web-time"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5a6580f308b1fad9207618087a65c04e7a10bc77e02c8e84e9b00dd4b12fa0bb"
+dependencies = [
+ "js-sys",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "webkit2gtk"
 version = "2.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8624,6 +8761,15 @@ dependencies = [
  "pkg-config",
  "soup3-sys",
  "system-deps 6.2.2",
+]
+
+[[package]]
+name = "webpki-roots"
+version = "1.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "22cfaf3c063993ff62e73cb4311efde4db1efb31ab78a3e5c457939ad5cc0bed"
+dependencies = [
+ "rustls-pki-types",
 ]
 
 [[package]]
